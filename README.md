@@ -1,4 +1,4 @@
-# SM2DH2C
+# Team SM2DH2C
 
 ## Team Members
 1. Sofia Monge - sofiamonge5
