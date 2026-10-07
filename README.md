@@ -6,3 +6,4 @@
 3. Diya Deepu - diyadeepuOSU
 4. Mari Tokuda - tokudam-dot
 5. Heeseo Kim - heeseoKOSU
+6. Chase Vanderlip - vanderlc-OSU
