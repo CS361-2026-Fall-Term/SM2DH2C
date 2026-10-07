@@ -5,3 +5,4 @@
 2. Helena Bianco Oliveira - biancooh
 3. Diya Deepu - diyadeepuOSU
 4. Mari Tokuda - tokudam-dot
+5. Heeseo Kim - heeseoKOSU
