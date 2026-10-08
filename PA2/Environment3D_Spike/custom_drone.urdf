@@ -1,0 +1,112 @@
+<?xml version="1.0"?>
+<robot name="realistic_quadcopter">
+
+  <!-- Central Avionics & Battery Hub -->
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.7"/>
+      <inertia ixx="0.002" ixy="0.0" ixz="0.0" iyy="0.002" iyz="0.0" izz="0.004"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.08" length="0.04"/>
+      </geometry>
+      <material name="dark_grey">
+        <color rgba="0.15 0.15 0.15 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <cylinder radius="0.08" length="0.04"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Front Left Arm & Motor -->
+  <link name="arm_fl">
+    <visual>
+      <origin xyz="0.07 0.07 0" rpy="0 1.5708 0.7854"/>
+      <geometry><cylinder radius="0.008" length="0.12"/></geometry>
+      <material name="carbon"><color rgba="0.2 0.2 0.2 1.0"/></material>
+    </visual>
+    <visual>
+      <origin xyz="0.11 0.11 0.015" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.015" length="0.03"/></geometry>
+      <material name="motor_silver"><color rgba="0.8 0.8 0.8 1.0"/></material>
+    </visual>
+  </link>
+  <joint name="base_to_arm_fl" type="fixed"><parent link="base_link"/><child link="arm_fl"/></joint>
+
+  <!-- Front Right Arm & Motor -->
+  <link name="arm_fr">
+    <visual>
+      <origin xyz="0.07 -0.07 0" rpy="0 1.5708 -0.7854"/>
+      <geometry><cylinder radius="0.008" length="0.12"/></geometry>
+      <material name="carbon"/>
+    </visual>
+    <visual>
+      <origin xyz="0.11 -0.11 0.015" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.015" length="0.03"/></geometry>
+      <material name="motor_silver"/>
+    </visual>
+  </link>
+  <joint name="base_to_arm_fr" type="fixed"><parent link="base_link"/><child link="arm_fr"/></joint>
+
+  <!-- Rear Left Arm & Motor -->
+  <link name="arm_bl">
+    <visual>
+      <origin xyz="-0.07 0.07 0" rpy="0 1.5708 2.3562"/>
+      <geometry><cylinder radius="0.008" length="0.12"/></geometry>
+      <material name="carbon"/>
+    </visual>
+    <visual>
+      <origin xyz="-0.11 0.11 0.015" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.015" length="0.03"/></geometry>
+      <material name="motor_silver"/>
+    </visual>
+  </link>
+  <joint name="base_to_arm_bl" type="fixed"><parent link="base_link"/><child link="arm_bl"/></joint>
+
+  <!-- Rear Right Arm & Motor -->
+  <link name="arm_br">
+    <visual>
+      <origin xyz="-0.07 -0.07 0" rpy="0 1.5708 -2.3562"/>
+      <geometry><cylinder radius="0.008" length="0.12"/></geometry>
+      <material name="carbon"/>
+    </visual>
+    <visual>
+      <origin xyz="-0.11 -0.11 0.015" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.015" length="0.03"/></geometry>
+      <material name="motor_silver"/>
+    </visual>
+  </link>
+  <joint name="base_to_arm_br" type="fixed"><parent link="base_link"/><child link="arm_br"/></joint>
+
+  <!-- Front Orientation Marker (Helps you see which way the drone faces) -->
+  <link name="nose_cone">
+    <visual>
+      <origin xyz="0.07 0 0.01" rpy="0 0 0"/>
+      <geometry><box size="0.03 0.04 0.02"/></geometry>
+      <material name="bright_red"><color rgba="0.9 0.1 0.1 1.0"/></material>
+    </visual>
+  </link>
+  <joint name="base_to_nose" type="fixed"><parent link="base_link"/><child link="nose_cone"/></joint>
+
+  <!-- Protective Skids / Landing Gear -->
+  <link name="landing_gear">
+    <visual>
+      <origin xyz="0 0.04 -0.04" rpy="1.5708 0 0"/>
+      <geometry><cylinder radius="0.004" length="0.12"/></geometry>
+      <material name="dark_grey"/>
+    </visual>
+    <visual>
+      <origin xyz="0 -0.04 -0.04" rpy="1.5708 0 0"/>
+      <geometry><cylinder radius="0.004" length="0.12"/></geometry>
+      <material name="dark_grey"/>
+    </visual>
+  </link>
+  <joint name="base_to_gear" type="fixed"><parent link="base_link"/><child link="landing_gear"/></joint>
+
+</robot>
