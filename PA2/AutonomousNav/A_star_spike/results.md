@@ -1,0 +1,1 @@
+Ran the library's image_pathfinding.py example on its sample map. A* algorithm found an obstacle-free path from start to goal, including through 1-pixel-wide openings in the walls (verified by zooming into the foo.png) No wall pixels were crossed.
