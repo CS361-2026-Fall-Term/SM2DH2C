@@ -1,6 +1,8 @@
 """
 Missing Person + "Found" Detection  (SAR drone, PyBullet world from SM2DH2C)
 
+Check UI for detection and how it send information
+
 Two parts, both usable on their own or inside another script:
 
   MissingPerson   - the casualty inside the simulation: a humanoid body (same model,
