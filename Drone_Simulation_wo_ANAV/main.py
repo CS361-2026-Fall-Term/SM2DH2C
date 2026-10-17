@@ -7,10 +7,18 @@ import math
 import time
 import pybullet as p
 from env_sim import build_world
-from ObjectAvoidance import Navigator, DT, DRONE_START_POS
+from ObjectAvoidance import Navigator, DT, DRONE_START_POS, OBSTACLE_POSITIONS, FLIGHT_PATH
 from TargetDetection import MissingPerson, SearchMonitor
 from operator_guidance_spike import Mission, Cmd, ZONES, ARRIVE_DIST
+from probability_map import ProbabilityMap
 
+# Figures out how big the zone is from where everything in the env is palced, then sizes the probability map off that
+def search_bounds(margins = 3.0):
+    pts = [DRONE_START_POS] + list(OBSTACLE_POSITIONS) + list(FLIGHT_PATH)
+    xs = [pt[0] for pt in pts]
+    ys = [pt[1] for pt in pts]
+    return ((min(xs) - margins, max(xs) + margins), (min(ys) - margins, max(ys) + margins))
+    # Creates a border w/ padding (3m)
 
 def set_destination(nav, xy):
     """Change high-level destination; Navigator still owns obstacle-safe routing."""
@@ -38,6 +46,12 @@ def main():
     p.setRealTimeSimulation(0)
     person = MissingPerson.spawn()
     monitor = SearchMonitor(person, gui=gui)
+    
+    # Sanity-check for probability map    
+    x_range, y_range = search_bounds()
+    print("Search area:", x_range, y_range)
+    belief = ProbabilityMap(x_range=x_range, y_range=y_range, pod=0.65)
+    
     mission = Mission()
     # Two-point route is replaced when the mission starts.
     nav = Navigator(drone_id, floor_id, person.body_id,
@@ -102,8 +116,11 @@ def main():
                     mission.state = "COMPLETE"
                     mission.response = "Returned to launch"
                 elif nav.state == "DONE" and not mission.destination:
+                    target = belief.best_target(nav.pos[:2], distance_weight=0.1)
+                    set_destination(nav, target)
                     mission.state = "COMPLETE"
-                    mission.response = "Search plan complete; person not confirmed"
+                    mission.response = f'Search plan complete; person not confirmed, but most likely in cell {target}'
+
             else:
                 nav.t += DT
 
@@ -122,12 +139,15 @@ def main():
             p.stepSimulation()
             if mission.state == "SEARCHING":
                 monitor.update(nav.pos, nav.t)
+                monitor.update(nav.pos, nav.t)
+                belief.observe_camera(monitor, nav.pos, trees = OBSTACLE_POSITIONS)
                 if monitor.found:
                     mission.found()
                     nav.route = []
                     nav.state = "FOUND"
 
             if gui and step_count % 30 == 0:
+                belief.draw()
                 info = (f"Mission: {mission.state} | Nav: {nav.state} | "
                         f"Detection: {monitor.state} ({monitor.confidence:.2f})\n"
                         f"Destination: {mission.destination} | Plan: {mission.plan}\n"
