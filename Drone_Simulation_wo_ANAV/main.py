@@ -11,6 +11,10 @@ from ObjectAvoidance import Navigator, DT, DRONE_START_POS, OBSTACLE_POSITIONS, 
 from TargetDetection import MissingPerson, SearchMonitor
 from operator_guidance_spike import Mission, Cmd, ZONES, ARRIVE_DIST
 from probability_map import ProbabilityMap
+from DSSE import DroneSwarmSearch
+
+# CONSTANTS
+MAX_BELIEF_LEGS = 20
 
 # Figures out how big the zone is from where everything in the env is palced, then sizes the probability map off that
 def search_bounds(margins = 3.0):
@@ -31,8 +35,9 @@ def set_destination(nav, xy):
     # acceleration limiter will smoothly adapt to the new route.
     nav.emergency_stops = 0
     nav.last_replan_t = -99
-    nav.draw_route()
-
+    nav.sense()     # scans so that the obstacle map knows what's around
+    nav.replan()   # A* from the current position to xy; falls back to a straight line if theres no path
+    nav.draw_route() # reroute
 
 def main():
     parser = argparse.ArgumentParser()
@@ -51,6 +56,18 @@ def main():
     x_range, y_range = search_bounds()
     print("Search area:", x_range, y_range)
     belief = ProbabilityMap(x_range=x_range, y_range=y_range, pod=0.65)
+
+    # Seed the belief map with DSSE's probability model around the last known position
+    GRID = 40
+    lkp = (person.position[0] - 3, person.position[1] + 2)   # last known position: a few m off the truth
+    col = int((lkp[0] - x_range[0]) / (x_range[1] - x_range[0]) * GRID)
+    row = int((lkp[1] - y_range[0]) / (y_range[1] - y_range[0]) * GRID)
+    dsse = DroneSwarmSearch(grid_size=GRID, render_mode="ansi", drone_amount=1,
+                            person_initial_position=(col, row), vector=(0.3, 0.3),
+                            timestep_limit=10, pre_render_time=0)
+    obs, _ = dsse.reset(options={"drones_positions": [(0, 0)]})
+    belief.set_prior(obs[dsse.get_agents()[0]][1])
+    dsse.close()
     
     mission = Mission()
     # Two-point route is replaced when the mission starts.
@@ -66,6 +83,8 @@ def main():
     last = {}
     status_id = None
     step_count = 0
+    belief_legs = 0
+
     if gui:
         start_button = p.addUserDebugParameter("START MISSION", 1, 0, 0)
         buttons = {cmd: p.addUserDebugParameter(cmd.value, 1, 0, 0) for cmd in Cmd}
@@ -116,11 +135,17 @@ def main():
                     mission.state = "COMPLETE"
                     mission.response = "Returned to launch"
                 elif nav.state == "DONE" and not mission.destination:
-                    target = belief.best_target(nav.pos[:2], distance_weight=0.1)
-                    set_destination(nav, target)
-                    mission.state = "COMPLETE"
-                    mission.response = f'Search plan complete; person not confirmed, but most likely in cell {target}'
-
+                    belief.mark_searched(nav.pos[:2], belief.sensor_radius)
+                    belief_legs += 1
+                    if belief_legs > MAX_BELIEF_LEGS:
+                        target = belief.best_target(nav.pos[:2])
+                        mission.state = "COMPLETE"
+                        mission.response = f'Search plan complete; person not confirmed, but most likely in cell {target}'
+                    else:
+                        target = belief.best_target(nav.pos[:2], distance_weight=0.1)
+                        set_destination(nav, target)                # A* plans the route
+                        mission.response = f"Belief search leg {belief_legs}: heading to {target}"
+                    
             else:
                 nav.t += DT
 
