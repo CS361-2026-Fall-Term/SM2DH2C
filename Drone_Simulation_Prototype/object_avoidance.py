@@ -1,5 +1,5 @@
 """
-Contributor: Chase Vanderlip
+Contributor: Chase Vanderlip Mylan Bui (A* Integration)
 File Description: 
 1.Sense: simulated range sensor that uses pybullet ray casts, 
 360 degree x 3 pitch layers and scans around the drone every few physics steps
@@ -150,23 +150,35 @@ class ObstacleMap:
     def astar(self, start_xy, goal_xy, alt):
         """
         Shortest obstacle-free path on the grid at altitude `alt`.
+        start_xy: drone's current (x, y) in world meters.
+        goal_xy:  destination (x, y) in world meters.
+        alt:      flight altitude; only obstacles within +-VERT_CLEAR of it count as blocking.
         Returns a list of (x, y) points to fly (not including the start), or None if the
         goal is blocked or unreachable.
         """
+        # Convert world positions to grid cells. Give up early if either end is off the map
+        # or the goal itself is inside an obstacle.
         s, g = self.to_cell(*start_xy), self.to_cell(*goal_xy)
         if not self.in_bounds(s) or not self.in_bounds(g) or self.blocked_cell(g, alt):
             return None
+        # 8-connected grid: straight moves cost 1, diagonal moves cost sqrt(2).        
         moves = [(1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
                  (1, 1, 1.4142), (1, -1, 1.4142), (-1, 1, 1.4142), (-1, -1, 1.4142)]
 
+        # Heuristic: octile distance, the exact cost to the goal if nothing were in the way.
+        # It never overestimates, so A* still returns the shortest path.
         def h(c):
             dx, dy = abs(c[0] - g[0]), abs(c[1] - g[1])
             return (dx + dy) + (1.4142 - 2) * min(dx, dy)
 
+        # openq: priority queue of (estimated total cost, cost so far, cell), cheapest first.
+        # came:  cell -> the cell we reached it from, used to rebuild the path.
+        # gscore: cell -> cheapest known cost from the start.
         openq = [(h(s), 0.0, s)]
         came, gscore = {}, {s: 0.0}
         while openq:
             _, gc, cur = heapq.heappop(openq)
+            # Reached the goal: walk the `came` links backwards to get the path, then smooth it.            
             if cur == g:
                 path = [cur]
                 while cur in came:
@@ -174,26 +186,38 @@ class ObstacleMap:
                     path.append(cur)
                 path.reverse()
                 return self._smooth([self.to_xy(c) for c in path], alt, start_xy, goal_xy)
+            # Skip stale queue entries; a cheaper route to this cell was already found.            
             if gc > gscore.get(cur, 1e9):
                 continue
+            # Try each neighbor that isn't blocked at this altitude.            
             for dx, dy, cost in moves:
                 nb = (cur[0] + dx, cur[1] + dy)
                 if self.blocked_cell(nb, alt):
                     continue
+                # Don't move diagonally past the corner of an obstacle.                
                 if dx and dy and (self.blocked_cell((cur[0] + dx, cur[1]), alt) or
                                   self.blocked_cell((cur[0], cur[1] + dy), alt)):
                     continue  # no corner cutting
+                # Record the neighbor if this is the cheapest way found to reach it so far.
                 ng = gc + cost
                 if ng < gscore.get(nb, 1e9):
                     gscore[nb] = ng
                     came[nb] = cur
                     heapq.heappush(openq, (ng + h(nb), ng, nb))
+        # Queue ran out without reaching the goal: no path exists at this altitude.
         return None
 
     def _smooth(self, pts, alt, start_xy, goal_xy):
-        """String-pulling: drop waypoints that have a free straight line between neighbours."""
+        """
+        String-pulling: drop waypoints that have a free straight line between neighbours.
+        Grid paths zigzag cell to cell; this turns them into a few straight legs.
+        Returns the smoothed points, not including the start.
+        """
+        # Use the exact start/goal positions instead of their cell centers.
         pts = [start_xy] + pts[1:-1] + [goal_xy]
         out, i = [pts[0]], 0
+        # From each kept point, jump to the farthest point that can be reached in a straight,
+        # obstacle-free line, and skip everything in between.        
         while i < len(pts) - 1:
             j = len(pts) - 1
             while j > i + 1 and not self.line_free(pts[i], pts[j], alt):
@@ -308,16 +332,28 @@ class Navigator:
 
     # ----------------------------------------------------------- RESPOND --
     def replan(self):
-        """Plan a detour to the first reachable remaining waypoint at the current altitude."""
+        """
+        Plan a detour to the first reachable remaining waypoint at the current altitude.
+        Tries the remaining waypoints in order and uses A* to find an obstacle-free path to each.
+        Waypoints that can't be reached are skipped. In RTL mode the only goal is the launch point.
+        Returns True if a new route was set, False if no remaining waypoint is reachable
+        (on_blocked() then escalates to climbing or return-to-launch).
+        """
         start = (self.pos[0], self.pos[1])
+        # Route entries are (x, y, waypoint index). Detour points have index None, so this
+        # keeps only the real waypoints still ahead of the drone.        
         remaining = [r[2] for r in self.route if r[2] is not None]
+        # When returning to launch, the launch point (index -1) is the only goal.        
         if self.state == "RTL":
             remaining = [-1]
         for j in remaining:
             goal = self.wps[j] if j >= 0 else (DRONE_START_POS[0], DRONE_START_POS[1])
+            # If the waypoint falls inside an obstacle's safety margin, move it to the
+            # nearest free cell; A* can't plan into a blocked goal.
             snapped = self.map.nearest_free(goal, self.alt)
             if snapped is None:
                 continue
+            # Run A* from the drone's position. No path means try the next waypoint instead.
             path = self.map.astar(start, snapped, self.alt)
             if path is None:
                 continue
@@ -326,12 +362,15 @@ class Navigator:
                                      f"({snapped[0]:.1f}, {snapped[1]:.1f})")
             if j >= 0 and j != self.wp_next:
                 self.event("REPLAN", f"waypoint(s) {self.wp_next}..{j - 1} unreachable, skipped")
+            # Build the new route: A* detour points (index None), then the reached waypoint
+            # tagged with its index, then every later waypoint unchanged.            
             route = [(x, y, None) for (x, y) in path[:-1]]
             route.append((path[-1][0], path[-1][1], j if j >= 0 else None))
             if j >= 0:
                 route += [(self.wps[i][0], self.wps[i][1], i) for i in range(j + 1, len(self.wps))]
             self.route = route
             self.replans += 1
+            # Log the detour length for the event history.
             pts = [start] + path
             length = sum(math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
                          for i in range(1, len(pts)))
@@ -339,6 +378,7 @@ class Navigator:
                                  f"at alt {self.alt:.1f} m")
             self.draw_route()
             return True
+        # Every remaining waypoint was unreachable at this altitude.        
         return False
 
     def on_blocked(self, reason, emergency=False):

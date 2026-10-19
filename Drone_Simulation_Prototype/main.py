@@ -83,6 +83,8 @@ def set_destination(nav, xy):
     # acceleration limiter will smoothly adapt to the new route.
     nav.emergency_stops = 0
     nav.last_replan_t = -99
+    nav.sense()      # Scan surroundings so the obstacle map knows what's nearby.
+    nav.replan()     # A* from the current position to xy; falls back to a straight line if no path.
     nav.draw_route()
 
 
