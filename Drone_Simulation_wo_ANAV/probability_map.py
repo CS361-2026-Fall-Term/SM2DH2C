@@ -1,14 +1,13 @@
-"""Probability-of-area (belief) map for the SAR demo.
+"""Probability-of-area (belief) map for the SAR simulation.
 
-A grid where each cell holds P(missing person is in this cell).
-It is updated by:
-  - operator sightings        -> raise probability around a point
-  - operator exclusions       -> zero probability in an area
-  - drone coverage, no find   -> Bayesian "negative information" update
-  - optional diffusion        -> person may be walking around
-The mission uses it to decide where the drone should search next.
-
-Detection itself is still decided by SearchMonitor; this map only guides WHERE to look.
+Grid in which each cell holds the probability that the missing person is in that cell.
+Updated by:
+  - operator sightings        -> probability raised around a point
+  - operator exclusions       -> probability set to zero in an area
+  - drone coverage, no find   -> Bayesian negative-information update
+  - optional diffusion        -> models a person who may be moving
+The mission uses the map to choose where the drone searches next.
+Detection itself is handled by SearchMonitor; this map only guides where to look.
 """
 import numpy as np
 import pybullet as p
@@ -18,10 +17,10 @@ class ProbabilityMap:
     def __init__(self, x_range=(-12.0, 12.0), y_range=(-12.0, 12.0),
                  cell_size=1.0, sensor_radius=2.0, pod=0.8):
         """
-        x_range, y_range: world bounds in meters (match your env_sim floor)
+        x_range, y_range: world bounds in meters
         cell_size:        grid resolution in meters
-        sensor_radius:    how far the drone's (simulated) camera can see
-        pod:              probability of detection if the person IS in view
+        sensor_radius:    detection radius used by observe()
+        pod:              probability of detection when the person is in view
         """
         self.x0, self.x1 = x_range
         self.y0, self.y1 = y_range
@@ -38,7 +37,6 @@ class ProbabilityMap:
         self.grid = np.full((self.ny, self.nx), 1.0 / (self.nx * self.ny))
         self.excluded = np.zeros_like(self.grid, dtype=bool)
         self._last_cell = None
-        self._points_id = None
 
     # ---------- coordinate helpers ----------
     def to_cell(self, xy):
@@ -57,25 +55,25 @@ class ProbabilityMap:
         total = self.grid.sum()
         if total > 0:
             self.grid /= total
-        else:  # everything excluded/searched: fall back to uniform over allowed cells
+        else:  # all cells excluded/searched: reset to uniform over allowed cells
             self.grid[~self.excluded] = 1.0
             self.grid /= max(self.grid.sum(), 1e-12)
 
-    # ---------- updates from the operator ----------
+    # ---------- operator updates ----------
     def add_sighting(self, xy, sigma=2.5, weight=0.6):
-        """Witness report near xy. weight = how much we trust it (0..1)."""
+        """Witness report near xy. weight = trust in the report (0..1)."""
         g = np.exp(-((self.cx - xy[0]) ** 2 + (self.cy - xy[1]) ** 2) / (2 * sigma ** 2))
         g /= g.sum()
         self.grid = (1 - weight) * self.grid + weight * g
         self._normalize()
 
     def exclude(self, xy, radius):
-        """'Do not search this area' -> person assumed not there."""
+        """Area marked 'do not search'; person assumed not there."""
         self.excluded |= self._disk(xy, radius)
         self._normalize()
 
     def mark_searched(self, xy, radius):
-        """'This area has already been searched' (e.g., by a ground team)."""
+        """Area already searched by another source (e.g., a ground team)."""
         self.grid[self._disk(xy, radius)] *= (1 - self.pod)
         self._normalize()
 
@@ -87,10 +85,10 @@ class ProbabilityMap:
         self.grid = m[np.ix_(iy, ix)].copy()
         self._normalize()
 
-    # ---------- updates from the drone ----------
+    # ---------- drone updates ----------
     def observe(self, drone_xy):
-        """Drone looked here and did NOT find the person (Bayes update).
-        Safe to call every step: only updates when the drone enters a new cell."""
+        """Circular-footprint update: area around the drone searched, person not found.
+        Updates only when the drone enters a new cell."""
         cell = self.to_cell(drone_xy)
         if cell == self._last_cell:
             return
@@ -100,10 +98,9 @@ class ProbabilityMap:
 
     def observe_camera(self, monitor, drone_pos, trees=(), canopy_radius=1.0,
                        canopy_pod=0.3, ground_z=0.3):
-        """Like observe(), but uses SearchMonitor's real camera footprint (forward-tilted
-        wedge, FOV + max range) instead of a circle. Cells under a tree canopy get a
-        lower detection probability, since the camera often can't see through it.
-        Only updates when the drone enters a new cell."""
+        """Camera-footprint update using SearchMonitor's frustum (forward-tilted wedge,
+        FOV + max range). Cells under a tree canopy use a lower detection probability.
+        Updates only when the drone enters a new cell."""
         cell = self.to_cell(drone_pos)
         if cell == self._last_cell:
             return
@@ -121,7 +118,7 @@ class ProbabilityMap:
         self._normalize()
 
     def diffuse(self, rate=0.05):
-        """Spread probability to neighbors"""
+        """Spread probability to neighboring cells."""
         pad = np.pad(self.grid, 1, mode="edge")
         neighbors = (pad[:-2, 1:-1] + pad[2:, 1:-1] + pad[1:-1, :-2] + pad[1:-1, 2:]) / 4
         self.grid = (1 - rate) * self.grid + rate * neighbors
@@ -129,7 +126,7 @@ class ProbabilityMap:
 
     # ---------- queries ----------
     def best_target(self, from_xy=None, distance_weight=0.0):
-        """World (x, y) of the most promising cell. distance_weight > 0 prefers nearby cells."""
+        """World (x, y) of the most promising cell. distance_weight > 0 favors nearby cells."""
         score = self.grid.copy()
         if from_xy is not None and distance_weight > 0:
             d = np.hypot(self.cx - from_xy[0], self.cy - from_xy[1])
@@ -138,14 +135,13 @@ class ProbabilityMap:
         return self.to_world(ix, iy)
 
     def mass_near(self, xy, radius):
-        """Total probability inside a circle (useful for ranking search zones)."""
+        """Total probability inside a circle (used for ranking search zones)."""
         return float(self.grid[self._disk(xy, radius)].sum())
 
     # ---------- visualization ----------
     def draw(self, top_k=60, max_height=1.5):
-        """Draw the top_k most likely cells as vertical sticks on the ground.
-        Taller + redder = more likely. Uses debug lines (debug points can blank
-        out PyBullet's GUI button labels on some builds)."""
+        """Top_k most likely cells drawn as vertical sticks; taller and redder = more likely.
+        Uses debug lines because debug points can hide GUI button labels on some builds."""
         if not hasattr(self, "_line_ids"):
             self._line_ids = []
         flat = np.argsort(self.grid, axis=None)[-top_k:]
@@ -161,3 +157,34 @@ class ProbabilityMap:
                                                        replaceItemUniqueId=self._line_ids[k])
             else:
                 self._line_ids.append(p.addUserDebugLine(start, end, color, lineWidth=3))
+
+    def draw_heatmap(self, alpha=0.45, levels=8):
+        """Ground heatmap over every cell:
+             red    = ruled out (searched with no find, or excluded)
+             orange = less likely
+             yellow = possible location
+        Tiles are visual-only (no collision), so they do not block camera rays
+        or obstacle sensing. Only tiles whose color changed are updated."""
+        if not hasattr(self, "_tiles"):
+            half = 0.45 * self.cell
+            vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[half, half, 0.005],
+                                      rgbaColor=[1, 1, 0, alpha])
+            self._tiles = np.empty(self.grid.shape, dtype=int)
+            self._tile_level = np.full(self.grid.shape, -1, dtype=int)
+            for iy in range(self.ny):
+                for ix in range(self.nx):
+                    self._tiles[iy, ix] = p.createMultiBody(
+                        baseMass=0, baseCollisionShapeIndex=-1, baseVisualShapeIndex=vis,
+                        basePosition=[float(self.cx[iy, ix]), float(self.cy[iy, ix]), 0.01])
+
+        allowed = ~self.excluded
+        mean = self.grid[allowed].mean() if allowed.any() else 1.0
+        # ratio >= 1: at least as likely as an average allowed cell -> yellow
+        ratio = np.clip(self.grid / max(mean, 1e-12), 0.0, 1.0)
+        level = np.round(ratio * (levels - 1)).astype(int)
+        level[self.excluded] = 0
+
+        for iy, ix in zip(*np.nonzero(level != self._tile_level)):
+            v = level[iy, ix] / (levels - 1)          # 0 = red, 1 = yellow
+            p.changeVisualShape(int(self._tiles[iy, ix]), -1, rgbaColor=[1.0, v, 0.0, alpha])
+        self._tile_level = level

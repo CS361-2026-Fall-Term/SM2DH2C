@@ -147,7 +147,7 @@ def main():
                     nav.state = "FOUND"
 
             if gui and step_count % 30 == 0:
-                belief.draw()
+                belief.draw_heatmap()
                 info = (f"Mission: {mission.state} | Nav: {nav.state} | "
                         f"Detection: {monitor.state} ({monitor.confidence:.2f})\n"
                         f"Destination: {mission.destination} | Plan: {mission.plan}\n"
