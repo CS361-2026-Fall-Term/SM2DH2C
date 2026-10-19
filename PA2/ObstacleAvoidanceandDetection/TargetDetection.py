@@ -1,5 +1,5 @@
 """
-Missing Person + "Found" Detection  (SAR drone, PyBullet world from SM2DH2C)
+Missing Person + "Found" Detection  
 
 Check UI for detection and how it send information
 
