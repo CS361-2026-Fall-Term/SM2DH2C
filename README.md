@@ -9,10 +9,10 @@
 6. Chase Vanderlip - vanderlc-OSU
 7. Mylan Bui - MylanBui2
 
-##Product Goal
+## Product Goal
 Our product goal is to build an efficient and reliable human in the loop autonomous drone system that can effectively locate a missing person. The drone should handle tasks independently, like navigation, avoiding obstacles, and deciding search areas. The human operator can focus solely on the higher level in this system, simulating a search and rescue operation in a 3D environment. This system should take in live inputs from a human operator and seamlessly integrate it into the visual display. 
 
-#User Scenario
+# User Scenario
 For context, we are in an urgent situation where there is a missing person that needs to be located within a certain environment. 
 1. The user (operator) initiates the search mission by interacting with the START button in the simulation interface.
 2. As the mission starts, the drone autonomously navigates through the search environment.
