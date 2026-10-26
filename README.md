@@ -45,7 +45,7 @@ The primary users for this system are search and rescue team/first responder ope
 - Target Detection: The system must be capable of finding the missing person. 
 
 ## Non-Functional Requirements
-- Efficient Search Performance: The system should be able to decide the efficient route to complete the mission.
+- Search Performance: The system should be able to decide the most efficient route (i.e., route with the least travel distance) to complete the mission.
 - Clear User Interface: The operator interface should be in an intuitive and professional manner. 
 - Obstacle Handling: The drone should recognize the obstacles and re-route for an efficient search path. 
 - Fast System Response: The system should respond promptly to human operator’s inputs. 
