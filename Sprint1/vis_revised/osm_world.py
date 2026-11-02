@@ -565,12 +565,14 @@ class OSMScene:
         self.barriers = []      # [((x1, y1), (x2, y2), kind)]  hedge / fence / wall (visual only, low)
         self.parking_lots = []  # [polygon]  surface parking where parked cars are drawn
         self.pitches = []       # [(polygon, sport)]  sports fields that get white line markings
+        self.bridges = []       # [(polyline [(x, y), ...], width, category)]  roads/paths/rails on bridges
         self.dropped = []       # human-readable notes about features removed to keep the mission valid
         self.moved = {}         # keep_clear point -> where it was moved (it was on a building)
 
     def summary(self):
         return (f"{len(self.buildings)} buildings, {len(self.trees)} trees, "
-                f"{len(self.roads)} road/path segments, {len(self.water)} water areas, "
+                f"{len(self.roads)} road/path segments, {len(self.bridges)} bridges, "
+                f"{len(self.water)} water areas, "
                 f"{len(self.surfaces)} ground areas")
 
 
@@ -652,6 +654,9 @@ def parse_scene(osm_json, lat, lon, area_m=DEFAULT_AREA_M, keep_clear=(), seed=0
         except ValueError:
             pass
         width = max(MIN_ROAD_WIDTH, w * scale)
+        if tags.get("bridge", "no") not in ("no", "") and cat not in ("stream", "crossing") and len(pts) >= 2:
+            scene.bridges.append((list(pts), width, cat))    # drawn as a raised deck, not a flat road
+            return
         for a, b in zip(pts, pts[1:]):
             seg = clip_segment(a, b)
             if seg and math.hypot(seg[1][0] - seg[0][0], seg[1][1] - seg[0][1]) > 1e-3:
@@ -698,9 +703,11 @@ def parse_scene(osm_json, lat, lon, area_m=DEFAULT_AREA_M, keep_clear=(), seed=0
             x += s
 
     # Scattered trees should not stand in the middle of a road or path.
-    if scene.roads:
+    lines = [(a, b, w) for a, b, w, _ in scene.roads] + \
+            [(a, b, w) for pts, w, _ in scene.bridges for a, b in zip(pts, pts[1:])]
+    if lines:
         trees = [t for t in trees if not t[3] or all(
-            _point_segment_dist(t, a, b) > w / 2 + 0.3 for a, b, w, _ in scene.roads)]
+            _point_segment_dist(t, a, b) > w / 2 + 0.3 for a, b, w in lines)]
 
     # Trees must not sit inside buildings, and very close trees are merged.
     merged = []
@@ -824,6 +831,17 @@ def _building_collision(p, poly, h):
     return col, (verts, idx)
 
 
+def _bridge_segments(scene):
+    """Bridges as clipped flat road segments (for the simple look)."""
+    out = []
+    for pts, width, cat in scene.bridges:
+        for a, b in zip(pts, pts[1:]):
+            seg = clip_segment(a, b)
+            if seg and math.hypot(seg[1][0] - seg[0][0], seg[1][1] - seg[0][1]) > 1e-3:
+                out.append((seg[0], seg[1], width, cat))
+    return out
+
+
 def _build_simple(p, scene):
     """The original flat-colour look (also the fallback if anything in the detailed look fails)."""
     solid_ids = []
@@ -835,7 +853,7 @@ def _build_simple(p, scene):
                                   rgbaColor=[0.62, 0.58, 0.55, 1])
         solid_ids.append(p.createMultiBody(0, col, vis, [0, 0, 0]))
 
-    for a, b, width, *_ in scene.roads:
+    for a, b, width, *_ in list(scene.roads) + _bridge_segments(scene):
         length = math.hypot(b[0] - a[0], b[1] - a[1])
         vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[length / 2, width / 2, 0.005],
                                   rgbaColor=[0.35, 0.35, 0.35, 1])
@@ -871,6 +889,11 @@ def _build_detailed(p, scene, avoid=()):
         print("  roads drawn simple:", exc)
         _build_simple(p, _only(scene, roads=True))
     try:
+        _detailed_bridges(p, va, scene)
+    except Exception as exc:
+        print("  bridges drawn flat:", exc)
+        _build_simple(p, _only_bridges(scene))
+    try:
         _detailed_props(p, va, scene, avoid)
     except Exception as exc:
         print("  cars / fences / field lines skipped:", exc)
@@ -883,6 +906,7 @@ def _only(scene, water=False, roads=False):
     part = OSMScene()
     part.water = list(scene.water) if water else []
     part.roads = list(scene.roads) if roads else []
+    part.bridges = list(scene.bridges) if roads else []
     return part
 
 
@@ -920,6 +944,10 @@ def _detailed_lines(p, va, scene):
         for q in (a, b):
             key = (cat, round(q[0], 3), round(q[1], 3))
             ends[key] = ends.get(key, 0) + 1
+    for pts, width, cat in scene.bridges:                      # where a road meets a bridge
+        for q in (pts[0], pts[-1]):
+            key = (cat, round(q[0], 3), round(q[1], 3))
+            ends[key] = ends.get(key, 0) + 1
     joint = lambda cat, q: ends.get((cat, round(q[0], 3), round(q[1], 3)), 0) > 1
     for a, b, width, cat in scene.roads:
         L = math.hypot(b[0] - a[0], b[1] - a[1])
@@ -949,6 +977,103 @@ def _detailed_lines(p, va, scene):
         _mesh_bodies(p, mb, LINE_LAYERS[cat][1])
     _mesh_bodies(p, yellow, MARKING_RGB)
     _mesh_bodies(p, white, (0.93, 0.93, 0.90))
+
+
+def _only_bridges(scene):
+    part = OSMScene()
+    part.bridges = list(scene.bridges)
+    return part
+
+
+BRIDGE_MAX_DECK = 1.2      # sim m: deck top never higher than this (cruise altitude is 2.5 m)
+BRIDGE_RAIL = 0.22         # railing height above the deck
+BRIDGE_CONCRETE = (0.66, 0.64, 0.60)
+BRIDGE_RAIL_RGB = (0.80, 0.80, 0.78)
+
+
+def _detailed_bridges(p, va, scene):
+    """Bridges: raised deck (road surface on top, concrete sides and underside) with ramps at both
+    ends, railings, and pillars down to the ground/water. Visual only and below 1.5 m, so the drone
+    flies over them and sensing/navigation are unchanged."""
+    s = min(scene.scale, 1.2)
+    top_by_cat, concrete, rails = {}, va.MeshBuilder(), va.MeshBuilder()
+    for pts, width, cat in scene.bridges:
+        cum = [0.0]
+        for a, b in zip(pts, pts[1:]):
+            cum.append(cum[-1] + math.hypot(b[0] - a[0], b[1] - a[1]))
+        total = cum[-1]
+        if total < 1e-3:
+            continue
+        deck = min(BRIDGE_MAX_DECK, max(0.25, 0.06 * total))           # longer bridge -> higher deck
+        ramp = min(0.3 * total, max(1.0, 4 * deck))
+        slab = max(0.06, min(0.25, 0.4 * s))
+
+        def height(d):
+            u = min(d, total - d) / ramp
+            u = max(0.0, min(1.0, u))
+            return LINE_LAYERS[cat][0] + (deck - LINE_LAYERS[cat][0]) * u * u * (3 - 2 * u)
+
+        hw = width / 2
+        for i, (a, b) in enumerate(zip(pts, pts[1:])):
+            seg_len = cum[i + 1] - cum[i]
+            seg = clip_segment(a, b)
+            if seg is None or seg_len < 1e-6:
+                continue
+            ca, cb = seg
+            da = cum[i] + math.hypot(ca[0] - a[0], ca[1] - a[1])
+            db = cum[i] + math.hypot(cb[0] - a[0], cb[1] - a[1])
+            if db - da < 1e-4:
+                continue
+            ux, uy = (cb[0] - ca[0]) / (db - da), (cb[1] - ca[1]) / (db - da)
+            nx, ny = -uy * hw, ux * hw                                # left side offset
+            # short pieces, so the deck follows the ramp - flat - ramp profile instead of a peak
+            n_pieces = max(1, int(math.ceil((db - da) / max(0.25, ramp / 4))))
+            for k in range(n_pieces):
+                d0 = da + (db - da) * k / n_pieces
+                d1 = da + (db - da) * (k + 1) / n_pieces
+                p0 = (ca[0] + ux * (d0 - da), ca[1] + uy * (d0 - da))
+                p1 = (ca[0] + ux * (d1 - da), ca[1] + uy * (d1 - da))
+                _deck_piece(va, top_by_cat.setdefault(cat, va.MeshBuilder()), concrete, rails,
+                            p0, p1, height(d0), height(d1), nx, ny, slab)
+        # pillars at regular spacing along the raised part (at least a few per bridge)
+        span = total - 2 * ramp
+        spacing = max(2.0, min(25.0 * s, span / 3)) if span > 0 else None
+        d = ramp + (span - spacing * int(span / spacing)) / 2 if spacing else total + 1
+        while d <= total - ramp + 1e-6:
+            k = max(j for j in range(len(cum) - 1) if cum[j] <= d)
+            a, b = pts[k], pts[k + 1]
+            t = (d - cum[k]) / max(cum[k + 1] - cum[k], 1e-9)
+            c = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+            if abs(c[0]) <= sim_config.MAP_HALF and abs(c[1]) <= sim_config.MAP_HALF:
+                top = height(d) - slab
+                ang = math.atan2(b[1] - a[1], b[0] - a[0])
+                va.add_faceted(concrete, va.box_tris(c, ang, max(0.12, 0.6 * s), width * 0.8, 0.0, top),
+                               outward_from=(c[0], c[1], top / 2))
+            d += spacing
+    for cat, mb in top_by_cat.items():
+        _mesh_bodies(p, mb, LINE_LAYERS[cat][1])
+    _mesh_bodies(p, concrete, BRIDGE_CONCRETE)
+    _mesh_bodies(p, rails, BRIDGE_RAIL_RGB)
+
+
+def _deck_piece(va, top_mb, concrete, rails, ca, cb, ha, hb, nx, ny, slab):
+    """One short piece of bridge deck from ca (deck height ha) to cb (deck height hb).
+    nx, ny: offset from the centre line to the deck's left edge."""
+    al, ar = (ca[0] + nx, ca[1] + ny), (ca[0] - nx, ca[1] - ny)
+    bl, br = (cb[0] + nx, cb[1] + ny), (cb[0] - nx, cb[1] - ny)
+    T = [(al[0], al[1], ha), (ar[0], ar[1], ha), (br[0], br[1], hb), (bl[0], bl[1], hb)]
+    B = [(q[0], q[1], max(0.0, q[2] - slab)) for q in T]
+    va.add_faceted(top_mb, [(T[0], T[1], T[2]), (T[0], T[2], T[3])], up=True)    # road surface
+    mid = ((ca[0] + cb[0]) / 2, (ca[1] + cb[1]) / 2, (ha + hb) / 2 - slab / 2)
+    va.add_faceted(concrete, [(B[0], B[1], B[2]), (B[0], B[2], B[3]),             # underside
+                              (B[0], B[3], T[3]), (B[0], T[3], T[0]),             # left edge
+                              (B[1], T[1], T[2]), (B[1], T[2], B[2])],            # right edge
+                   outward_from=mid)
+    if max(ha, hb) > 0.15:                                    # railings on the raised part
+        for e0, e1 in ((T[0], T[3]), (T[1], T[2])):
+            q = [e0, e1, (e1[0], e1[1], e1[2] + BRIDGE_RAIL), (e0[0], e0[1], e0[2] + BRIDGE_RAIL)]
+            va.add_faceted(rails, [(q[0], q[1], q[2]), (q[0], q[2], q[3]),        # visible from
+                                   (q[0], q[2], q[1]), (q[0], q[3], q[2])])       # both sides
 
 
 def _edge_distance(pt, poly):

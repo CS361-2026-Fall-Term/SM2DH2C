@@ -1,13 +1,14 @@
 """Integrated single-drone PyBullet SAR demo.
-Run: python main.py                  (GUI; press START)
-     python main.py --headless       (auto-start; no GUI)
+Run: python main.py                  (mission setup window, then GUI; press START)
+     python main.py --no-ui          (skip the setup window; use command-line options / defaults)
+     python main.py --headless       (auto-start; no GUI, no setup window)
      python main.py --profile        (GUI; prints per-section timings every 5 s)
      python main.py --lat 45.5122 --lon -122.6587 --area 120   (OSM world around a last known position)
      python main.py --osm-file map.osm --lat 45.5122 --lon -122.6587  (offline, from an OSM export)
      python main.py --area 40                  (40 m x 40 m search map; layout and zones stretch to fit)
      python main.py --lat 45.5122 --lon -122.6587 --area 300 --map-size 60
                                                (300 real m of OSM squeezed into a 60 m map)
-     python main.py --free-camera              (camera does not follow the drone; move it with the mouse)
+     python main.py --camera follow            (camera: locked | follow | free - see CAMERA_MODES)
      python main.py --simple-visuals           (flat colours, no textures/tree models/shadows: faster)
 
 Search-area size:
@@ -21,6 +22,7 @@ import math
 import time
 import pybullet as p
 import env_sim
+import operator_setup
 import osm_world
 import sim_config
 from env_sim import build_world, FLIGHT_PATH, DRONE_START_POS, OBSTACLE_POSITIONS
@@ -35,6 +37,17 @@ from probability_map import ProbabilityMap
 RENDER_EVERY = 4
 HUD_EVERY = 8                 # HUD text refresh, in render ticks (60 / 8 = 7.5 Hz); only re-sent if changed
 BUTTON_POLL_EVERY = 3         # operator buttons are polled every 3rd render tick (20 Hz)
+FOLLOW_VIEW = (8.0, 45.0, -35.0)  # locked chase camera: distance (m), yaw (deg), pitch (deg)
+# Camera modes, in the order the in-sim "Camera" button cycles through them:
+#   locked - follows the drone at FOLLOW_VIEW; the user cannot move the camera
+#   follow - follows the drone; the user can orbit (Ctrl/Alt + drag) and zoom (wheel) around it
+#   free   - never moved by the program; the user has full mouse control
+CAMERA_MODES = ("locked", "follow", "free")
+CAMERA_HELP = {"locked": "following the drone, locked view (no user control)",
+               "follow": "following the drone; Ctrl/Alt + drag to orbit, wheel to zoom",
+               "free": "free; arrow keys / PageUp / PageDown to move, Ctrl/Alt + drag to rotate, "
+                       "wheel to zoom (Ctrl/Alt + middle-drag also pans)"}
+PAN_SPEED = 0.8               # free camera: arrow-key speed, in camera distances per second
 HEATMAP_BUDGET = 8            # max heatmap tiles recolored per render tick
 
 
@@ -106,6 +119,52 @@ def set_destination(nav, xy):
     nav.draw_route()
 
 
+def _free_camera_keys(dt):
+    """Free camera: arrow keys pan sideways / forward relative to where the camera looks,
+    PageUp / PageDown move it up / down. (Mouse panning is Ctrl/Alt + middle-drag, which
+    laptops and trackpads often can't do.)"""
+    keys = p.getKeyboardEvents()
+    held = lambda k: k in keys and keys[k] & p.KEY_IS_DOWN
+    right = held(p.B3G_RIGHT_ARROW) - held(p.B3G_LEFT_ARROW)
+    ahead = held(p.B3G_UP_ARROW) - held(p.B3G_DOWN_ARROW)
+    up = held(p.B3G_PAGE_UP) - held(p.B3G_PAGE_DOWN)
+    if not (right or ahead or up):
+        return
+    cam = p.getDebugVisualizerCamera()
+    yaw, pitch, dist, target = cam[8], cam[9], cam[10], cam[11]
+    fx, fy = cam[5][0], cam[5][1]                 # camera forward direction, flattened to the ground
+    n = math.hypot(fx, fy)
+    if n < 1e-6:                                  # looking straight down: use the yaw instead
+        fx, fy = -math.sin(math.radians(yaw)), math.cos(math.radians(yaw))
+        n = 1.0
+    fx, fy = fx / n, fy / n
+    step = PAN_SPEED * max(dist, 1.0) * dt
+    new_target = [target[0] + (fx * ahead + fy * right) * step,
+                  target[1] + (fy * ahead - fx * right) * step,
+                  max(0.0, target[2] + up * step)]
+    p.resetDebugVisualizerCamera(cameraDistance=dist, cameraYaw=yaw, cameraPitch=pitch,
+                                 cameraTargetPosition=new_target)
+
+
+def _setup_prefill(args):
+    """Command-line values the operator already gave, used to pre-fill the setup window."""
+    pre = {}
+    if args.lat is not None:
+        pre.update(mode="osm", lat=args.lat, lon=args.lon)
+    for key in ("area", "map_size", "max_time"):
+        if getattr(args, key) is not None:
+            pre[key] = getattr(args, key)
+    if args.osm_file:
+        pre.update(source="file", osm_file=args.osm_file)
+    if args.seed:
+        pre["seed"] = args.seed
+    if args.simple_visuals:
+        pre["visuals"] = "simple"
+    if args.camera or args.free_camera:
+        pre["camera"] = args.camera or "free"
+    return pre
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--headless", action="store_true")
@@ -124,12 +183,37 @@ def main():
                              f"({sim_config.MIN_MAP_SIZE:g}-{sim_config.MAX_MAP_SIZE:g})")
     parser.add_argument("--osm-file", help="Overpass .json or .osm export to use instead of downloading")
     parser.add_argument("--seed", type=int, default=0, help="seed for trees scattered in woods")
-    parser.add_argument("--free-camera", action="store_true",
-                        help="start with the camera NOT following the drone (toggle in the GUI)")
+    parser.add_argument("--camera", choices=CAMERA_MODES, default=None,
+                        help="locked = follow the drone, no user control (default); follow = follow "
+                             "the drone, user can orbit/zoom; free = user controls the camera")
+    parser.add_argument("--free-camera", action="store_true", help="same as --camera free")
     parser.add_argument("--simple-visuals", action="store_true",
                         help="flat colours instead of textured buildings, tree models, sky and "
                              "shadows (faster on slow computers; sensing/navigation identical)")
+    parser.add_argument("--no-ui", action="store_true",
+                        help="skip the mission setup window and use the command-line options")
     args = parser.parse_args()
+
+    # ---- Mission setup window (issue #55): the operator enters the initial information here,
+    # it is validated, and only then is the environment generated. Command-line values pre-fill it.
+    setup_summary = None
+    if not args.headless and not args.no_ui:
+        try:
+            cfg = operator_setup.ask(_setup_prefill(args))
+        except operator_setup.SetupUnavailable as exc:
+            print(f"Note: {exc}; using the command-line options instead.")
+            cfg = False
+        if cfg is None:
+            print("Mission setup cancelled; simulation not started.")
+            return
+        if cfg:
+            args.lat, args.lon, args.area = cfg["lat"], cfg["lon"], cfg["area"]
+            args.map_size, args.osm_file, args.seed = cfg["map_size"], cfg["osm_file"], cfg["seed"]
+            args.simple_visuals = cfg["simple_visuals"]
+            args.camera = cfg.get("camera") or ("free" if cfg.get("free_camera") else "locked")
+            args.max_time = cfg["max_time"]
+            setup_summary = cfg.get("summary", "")
+            print("Mission setup accepted:", setup_summary)
     if (args.lat is None) != (args.lon is None):
         parser.error("--lat and --lon must be given together")
     if args.osm_file and args.lat is None:
@@ -199,6 +283,8 @@ def main():
         p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
 
     mission = Mission()
+    if setup_summary is not None:
+        mission.response = "Setup accepted - environment generated. Press START MISSION"
     # Two-point route is replaced when the mission starts.
     nav = Navigator(drone_id, floor_id, person.body_id,
                     [DRONE_START_POS, [DRONE_START_POS[0], DRONE_START_POS[1], 2.5]], gui, print)
@@ -216,18 +302,19 @@ def main():
     last_info = None
     step_count = 0
     cam_pos = list(nav.pos)              # smoothed chase-camera target
-    follow_cam = not args.free_camera    # True: camera tracks the drone; False: user moves it freely
+    cam_mode = args.camera or ("free" if args.free_camera else "locked")    # see CAMERA_MODES
+    cam_view = list(FOLLOW_VIEW)         # current (distance, yaw, pitch), eased toward FOLLOW_VIEW
     cam_button = None
     if gui:
         start_button = p.addUserDebugParameter("START MISSION", 1, 0, 0)
         buttons = {cmd: p.addUserDebugParameter(cmd.value, 1, 0, 0) for cmd in Cmd}
         heat_button = p.addUserDebugParameter("Show / hide heatmap", 1, 0, 0)
-        cam_button = p.addUserDebugParameter("Camera: follow drone / free", 1, 0, 0)
+        cam_button = p.addUserDebugParameter("Camera: locked / follow / free", 1, 0, 0)
         last = {button: p.readUserDebugParameter(button)
                 for button in [start_button, heat_button, cam_button, *buttons.values()]}
-        # Starting view: same chase view as before, centred on the drone.
-        p.resetDebugVisualizerCamera(cameraDistance=8, cameraYaw=45, cameraPitch=-35,
-                                     cameraTargetPosition=cam_pos)
+        # Starting view: the locked chase view, centred on the drone.
+        p.resetDebugVisualizerCamera(cameraDistance=FOLLOW_VIEW[0], cameraYaw=FOLLOW_VIEW[1],
+                                     cameraPitch=FOLLOW_VIEW[2], cameraTargetPosition=cam_pos)
     else:
         mission.start()
         set_destination(nav, mission.destination)
@@ -257,9 +344,12 @@ def main():
                     cam_value = p.readUserDebugParameter(cam_button)
                     if cam_value != last[cam_button]:
                         last[cam_button] = cam_value
-                        follow_cam = not follow_cam
-                        print("Camera:", "following the drone" if follow_cam else
-                              "free (mouse: Ctrl/Alt + drag to rotate, middle-drag to pan, wheel to zoom)")
+                        cam_mode = CAMERA_MODES[(CAMERA_MODES.index(cam_mode) + 1) % len(CAMERA_MODES)]
+                        # glide from wherever the camera is now (no jump when the mode changes)
+                        cam = p.getDebugVisualizerCamera()
+                        cam_view[:] = [cam[10], cam[8], cam[9]]
+                        cam_pos[:] = list(cam[11])
+                        print("Camera:", CAMERA_HELP[cam_mode])
                     for cmd, button in buttons.items():
                         value = p.readUserDebugParameter(button)
                         if value != last[button]:
@@ -348,19 +438,32 @@ def main():
                                 kw["replaceItemUniqueId"] = status_id
                             status_id = p.addUserDebugText(info, hud_pos, **kw)
 
-                # Follow mode: only the camera's TARGET tracks the drone (low-passed so tiny changes
-                # in speed or direction don't read as stutter). Zoom, yaw and pitch are read back
-                # from the GUI each frame, so the user can still orbit and zoom with the mouse.
-                # Free mode: the camera is never touched, so the mouse has full control.
-                if follow_cam:
+                # Camera (see CAMERA_MODES). The target always eases toward the drone (low-passed so
+                # tiny speed/direction changes don't read as stutter).
+                #   locked: the program sets distance, angle and target every frame, so mouse drags
+                #           and scrolls have no effect; after a mode change it glides to FOLLOW_VIEW.
+                #   follow: only the target is set; distance and angle are read back from the GUI
+                #           each frame, so the user can orbit and zoom around the drone.
+                #   free:   the program only moves the camera when the user holds the arrow keys
+                #           (pan) or PageUp/PageDown (up/down); the mouse controls everything else.
+                if cam_mode == "free":
+                    with prof.section("camera"):
+                        _free_camera_keys(render_every * DT)
+                else:
                     with prof.section("camera"):
                         for i in range(3):
                             cam_pos[i] += 0.2 * (nav.pos[i] - cam_pos[i])
-                        cam = p.getDebugVisualizerCamera()
+                        if cam_mode == "locked":
+                            cam_view[0] += 0.15 * (FOLLOW_VIEW[0] - cam_view[0])
+                            cam_view[1] += 0.15 * ((FOLLOW_VIEW[1] - cam_view[1] + 180) % 360 - 180)
+                            cam_view[2] += 0.15 * (FOLLOW_VIEW[2] - cam_view[2])
+                        else:
+                            cam = p.getDebugVisualizerCamera()
+                            cam_view[:] = [cam[10], cam[8], cam[9]]
                         p.resetDebugVisualizerCamera(
-                            cameraDistance=cam[10],
-                            cameraYaw=cam[8],
-                            cameraPitch=cam[9],
+                            cameraDistance=cam_view[0],
+                            cameraYaw=cam_view[1],
+                            cameraPitch=cam_view[2],
                             cameraTargetPosition=cam_pos
                         )
 
