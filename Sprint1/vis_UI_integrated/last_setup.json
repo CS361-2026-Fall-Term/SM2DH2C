@@ -1,0 +1,13 @@
+{
+  "mode": "osm",
+  "lat": "44.565296",
+  "lon": "-123.276016",
+  "area": "60",
+  "source": "download",
+  "osm_file": "",
+  "map_size": "",
+  "seed": "0",
+  "visuals": "detailed",
+  "camera": "follow",
+  "max_time": ""
+}
