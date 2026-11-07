@@ -1,0 +1,1515 @@
+--- a/visual_assets.py
++++ b/visual_assets.py
+@@ -0,0 +1,341 @@
++"""
++File Description: Visual-only helpers that make the PyBullet scene look closer to the real place.
++Nothing in this file creates collision shapes, so navigation, the LIDAR ray scan, and the
++person-detection camera behave exactly the same with or without it.
++
++  - write_png / facade_texture: procedurally generated wall textures (window grid per storey),
++    written once to textures/ next to this file. No image library needed (numpy + zlib only).
++  - MeshBuilder: collects triangles for many flat features (roads, grass, parking...) into a few
++    large meshes, split into chunks so no single PyBullet mesh gets too big.
++  - tree_canopy_mesh: low-poly deciduous (lumpy sphere) and conifer (stacked cones) canopies.
++"""
++import math
++import os
++import random
++import struct
++import zlib
++
++import numpy as np
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++TEXTURE_DIR = os.path.join(HERE, "textures")
++
++MAX_VERTS = 2000                  # per PyBullet mesh; bigger features are split across meshes
++MAX_INDICES = 6000
++
++
++# ------------------------------------------------------------------ colours
++NAMED_COLOURS = {
++    "white": (0.93, 0.93, 0.91), "grey": (0.60, 0.60, 0.60), "gray": (0.60, 0.60, 0.60),
++    "lightgrey": (0.78, 0.78, 0.76), "lightgray": (0.78, 0.78, 0.76),
++    "darkgrey": (0.35, 0.35, 0.35), "darkgray": (0.35, 0.35, 0.35), "black": (0.15, 0.15, 0.15),
++    "red": (0.62, 0.22, 0.18), "brown": (0.45, 0.30, 0.20), "beige": (0.84, 0.78, 0.64),
++    "tan": (0.78, 0.68, 0.52), "yellow": (0.88, 0.80, 0.45), "orange": (0.85, 0.52, 0.25),
++    "blue": (0.30, 0.42, 0.62), "green": (0.32, 0.50, 0.32), "silver": (0.75, 0.75, 0.78),
++    "maroon": (0.45, 0.15, 0.15), "cream": (0.92, 0.88, 0.76),
++}
++
++
++def parse_colour(value):
++    """OSM colour tag ('#a0522d', 'a0522d', 'brown') -> (r, g, b) in 0..1, or None."""
++    if not value:
++        return None
++    v = str(value).strip().lower().replace(" ", "")
++    if v in NAMED_COLOURS:
++        return NAMED_COLOURS[v]
++    v = v.lstrip("#")
++    if len(v) == 3:
++        v = "".join(c * 2 for c in v)
++    if len(v) == 6:
++        try:
++            return tuple(int(v[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
++        except ValueError:
++            return None
++    return None
++
++
++# ------------------------------------------------------------------ PNG + textures
++def write_png(path, rgb):
++    """Write an (H, W, 3) uint8 array as a PNG using only zlib."""
++    rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
++    h, w, _ = rgb.shape
++    raw = b"".join(b"\x00" + rgb[y].tobytes() for y in range(h))
++
++    def chunk(kind, data):
++        body = kind + data
++        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
++
++    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
++           + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
++    with open(path, "wb") as f:
++        f.write(png)
++
++
++# Default wall colour per style (used when the building has no building:colour tag).
++STYLE_WALL = {
++    "brick": (0.58, 0.27, 0.20),
++    "siding": (0.86, 0.83, 0.74),
++    "stucco": (0.82, 0.76, 0.64),
++    "glass": (0.62, 0.66, 0.70),
++    "metal": (0.66, 0.67, 0.68),
++}
++STYLE_ROOF = {
++    "brick": (0.30, 0.30, 0.32),
++    "siding": (0.33, 0.27, 0.24),
++    "stucco": (0.55, 0.30, 0.22),
++    "glass": (0.55, 0.56, 0.58),
++    "metal": (0.72, 0.73, 0.74),
++}
++
++
++def facade_texture(style, wall_rgb, size=64):
++    """
++    One 'bay' of wall (about 3 m wide x 1 storey high): wall material plus one window.
++    The mesh UVs repeat it along the wall and up each floor. Returns the PNG path (cached).
++    The image is vertically symmetric, so it looks right whichever way the renderer flips v.
++    """
++    os.makedirs(TEXTURE_DIR, exist_ok=True)
++    key = f"{style}_{int(wall_rgb[0] * 255):02x}{int(wall_rgb[1] * 255):02x}{int(wall_rgb[2] * 255):02x}"
++    path = os.path.join(TEXTURE_DIR, f"facade_{key}.png")
++    if os.path.exists(path):
++        return path
++
++    rng = np.random.default_rng(zlib.crc32(key.encode()))      # same texture every run
++    n = size
++    yy, xx = np.mgrid[0:n, 0:n]
++    base = np.array(wall_rgb, dtype=float)
++    img = np.ones((n, n, 3)) * base
++    img *= (1.0 + rng.normal(0, 0.035, (n, n, 1)))                 # subtle grain
++
++    if style == "brick":
++        mortar = (yy % 8 == 0) | (((xx + 8 * ((yy // 8) % 2)) % 16) == 0)
++        img[mortar] = base * 0.55 + 0.35
++        brick_tone = rng.normal(0, 0.06, (n // 8 + 1, n // 16 + 2, 1))
++        img *= 1.0 + brick_tone[yy // 8, (xx + 8 * ((yy // 8) % 2)) // 16]
++        win = (xx >= 16) & (xx < 48) & (yy >= 14) & (yy < 50)
++    elif style == "siding":
++        img[(yy % 6) == 0] *= 0.82                                  # horizontal lap boards
++        win = (xx >= 18) & (xx < 46) & (yy >= 16) & (yy < 48)
++    elif style == "glass":
++        win = (xx >= 3) & (xx < 61) & (yy >= 6) & (yy < 58)          # curtain wall
++    elif style == "metal":
++        img[(xx % 6) < 2] *= 0.85                                    # corrugated panels
++        win = (xx >= 22) & (xx < 42) & (yy >= 26) & (yy < 38)        # small high window
++    else:                                                            # stucco
++        win = (xx >= 18) & (xx < 46) & (yy >= 16) & (yy < 48)
++
++    # window: dark glass with a soft diagonal sky reflection, light frame around it
++    frame = np.zeros_like(win)
++    ys, xs = np.where(win)
++    if len(ys):
++        y0, y1, x0, x1 = ys.min(), ys.max(), xs.min(), xs.max()
++        frame = (yy >= y0 - 2) & (yy <= y1 + 2) & (xx >= x0 - 2) & (xx <= x1 + 2) & ~win
++        refl = 0.5 + 0.5 * np.clip(1.0 - np.abs((xx - x0) - (yy - y0) * 0.6) / 25.0, 0, 1)
++        glass = np.stack([0.20 + 0.18 * refl, 0.26 + 0.20 * refl, 0.32 + 0.24 * refl], axis=-1)
++        img[win] = glass[win]
++        img[frame] = np.array([0.88, 0.87, 0.84]) if style != "glass" else base * 0.7
++    img = np.clip(img, 0, 1)
++    img = (img + img[::-1]) / 2 if style != "brick" else img       # keep symmetric top/bottom
++    write_png(path, (img * 255).astype(np.uint8))
++    return path
++
++
++# ------------------------------------------------------------------ geometry helpers
++def simplify(ring, tol):
++    """Douglas-Peucker simplification of a closed ring (keeps at least 3 points)."""
++    if len(ring) <= 4 or tol <= 0:
++        return list(ring)
++
++    def dp(pts):
++        if len(pts) < 3:
++            return pts
++        a, b = pts[0], pts[-1]
++        dx, dy = b[0] - a[0], b[1] - a[1]
++        L = math.hypot(dx, dy) or 1e-12
++        dmax, idx = 0.0, 0
++        for i in range(1, len(pts) - 1):
++            d = abs(dy * (pts[i][0] - a[0]) - dx * (pts[i][1] - a[1])) / L
++            if d > dmax:
++                dmax, idx = d, i
++        if dmax <= tol:
++            return [a, b]
++        return dp(pts[:idx + 1])[:-1] + dp(pts[idx:])
++
++    # split the ring at its farthest point from the first point so both halves are open chains
++    far = max(range(len(ring)), key=lambda i: math.hypot(ring[i][0] - ring[0][0], ring[i][1] - ring[0][1]))
++    out = dp(list(ring[:far + 1]))[:-1] + dp(list(ring[far:]) + [ring[0]])[:-1]
++    return out if len(out) >= 3 else list(ring)
++
++
++class MeshBuilder:
++    """Accumulates triangles (with normals and UVs) and splits them into PyBullet-sized chunks."""
++
++    def __init__(self):
++        self.chunks = []
++        self._new()
++
++    def _new(self):
++        self.v, self.n, self.uv, self.i = [], [], [], []
++        self.chunks.append((self.v, self.n, self.uv, self.i))
++
++    def _room(self, nv, ni):
++        if len(self.v) + nv > MAX_VERTS or len(self.i) + ni > MAX_INDICES:
++            if self.v:
++                self._new()
++
++    def add(self, verts, tris, normal=None, normals=None, uvs=None):
++        """verts: list of (x, y, z); tris: index triples into verts (counter-clockwise from outside)."""
++        if not tris:
++            return
++        self._room(len(verts), 3 * len(tris))
++        base = len(self.v)
++        self.v.extend([list(map(float, p)) for p in verts])
++        if normals is None:
++            normals = [normal or (0.0, 0.0, 1.0)] * len(verts)
++        self.n.extend([list(map(float, q)) for q in normals])
++        self.uv.extend([list(map(float, q)) for q in (uvs or [(p[0], p[1]) for p in verts])])
++        for a, b, c in tris:
++            self.i.extend([base + a, base + b, base + c])
++
++    def add_flat_polygon(self, poly, z, triangulate):
++        tris = triangulate(poly)
++        if tris:
++            self.add([(x, y, z) for x, y in poly], tris)
++
++    def add_strip(self, a, b, width, z):
++        """Flat quad of the given width from a to b, plus round caps so polylines join cleanly."""
++        dx, dy = b[0] - a[0], b[1] - a[1]
++        L = math.hypot(dx, dy)
++        if L < 1e-6:
++            return
++        nx, ny = -dy / L * width / 2, dx / L * width / 2
++        quad = [(a[0] + nx, a[1] + ny, z), (a[0] - nx, a[1] - ny, z),
++                (b[0] - nx, b[1] - ny, z), (b[0] + nx, b[1] + ny, z)]
++        self.add(quad, [(0, 1, 2), (0, 2, 3)])          # (nx, ny) is the left normal -> faces up
++        for c in (a, b):
++            self.add_disc(c, width / 2, z)
++
++    def add_disc(self, c, r, z, sides=8):
++        verts = [(c[0], c[1], z)] + [(c[0] + r * math.cos(2 * math.pi * k / sides),
++                                      c[1] + r * math.sin(2 * math.pi * k / sides), z) for k in range(sides)]
++        self.add(verts, [(0, 1 + k, 1 + (k + 1) % sides) for k in range(sides)])
++
++    def meshes(self):
++        """Non-empty chunks as (vertices, normals, uvs, indices)."""
++        return [c for c in self.chunks if c[0]]
++
++
++def ensure_ccw(poly):
++    area = 0.5 * sum(poly[i - 1][0] * poly[i][1] - poly[i][0] * poly[i - 1][1] for i in range(len(poly)))
++    return list(poly) if area > 0 else list(reversed(poly))
++
++
++def wall_mesh(poly, height, bay_w, storey_h):
++    """Outward-facing walls with flat normals and UVs: u counts bays along the wall, v counts storeys."""
++    poly = ensure_ccw(poly)
++    verts, normals, uvs, tris = [], [], [], []
++    u = 0.0
++    for k in range(len(poly)):
++        a, b = poly[k], poly[(k + 1) % len(poly)]
++        dx, dy = b[0] - a[0], b[1] - a[1]
++        L = math.hypot(dx, dy)
++        if L < 1e-6:
++            continue
++        nrm = (dy / L, -dx / L, 0.0)                      # outward for a CCW ring
++        u1 = u + L / bay_w
++        v1 = height / storey_h
++        base = len(verts)
++        verts += [(a[0], a[1], 0.0), (b[0], b[1], 0.0), (b[0], b[1], height), (a[0], a[1], height)]
++        normals += [nrm] * 4
++        uvs += [(u, 0.0), (u1, 0.0), (u1, v1), (u, v1)]
++        tris += [(base, base + 1, base + 2), (base, base + 2, base + 3)]
++        u = u1 % 1.0                                      # keep UVs small; texture repeats per bay
++    return verts, normals, uvs, tris
++
++
++# ------------------------------------------------------------------ trees
++def _icosphere():
++    t = (1 + 5 ** 0.5) / 2
++    v = [(-1, t, 0), (1, t, 0), (-1, -t, 0), (1, -t, 0), (0, -1, t), (0, 1, t), (0, -1, -t), (0, 1, -t),
++         (t, 0, -1), (t, 0, 1), (-t, 0, -1), (-t, 0, 1)]
++    v = [tuple(c / math.sqrt(sum(q * q for q in p)) for c in p) for p in v]
++    f = [(0, 11, 5), (0, 5, 1), (0, 1, 7), (0, 7, 10), (0, 10, 11), (1, 5, 9), (5, 11, 4), (11, 10, 2),
++         (10, 7, 6), (7, 1, 8), (3, 9, 4), (3, 4, 2), (3, 2, 6), (3, 6, 8), (3, 8, 9), (4, 9, 5),
++         (2, 4, 11), (6, 2, 10), (8, 6, 7), (9, 8, 1)]
++    cache = {}
++
++    def mid(a, b):
++        key = (min(a, b), max(a, b))
++        if key not in cache:
++            p = [(v[a][i] + v[b][i]) / 2 for i in range(3)]
++            m = math.sqrt(sum(c * c for c in p))
++            v.append(tuple(c / m for c in p))
++            cache[key] = len(v) - 1
++        return cache[key]
++
++    out = []
++    for a, b, c in f:
++        ab, bc, ca = mid(a, b), mid(b, c), mid(c, a)
++        out += [(a, ab, ca), (b, bc, ab), (c, ca, bc), (ab, bc, ca)]
++    return v, out
++
++
++_ICO = _icosphere()
++
++
++def _flat(verts, tris):
++    """Duplicate vertices per face so each triangle gets its own normal (faceted low-poly look)."""
++    out_v, out_n, out_t = [], [], []
++    for a, b, c in tris:
++        pa, pb, pc = verts[a], verts[b], verts[c]
++        u = [pb[i] - pa[i] for i in range(3)]
++        w = [pc[i] - pa[i] for i in range(3)]
++        n = (u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0])
++        m = math.sqrt(sum(q * q for q in n)) or 1.0
++        n = tuple(q / m for q in n)
++        base = len(out_v)
++        out_v += [pa, pb, pc]
++        out_n += [n, n, n]
++        out_t.append((base, base + 1, base + 2))
++    return out_v, out_n, out_t
++
++
++def tree_canopy_mesh(kind, seed, radius=0.78):
++    """
++    Canopy mesh centred on (0, 0, 0) that stays inside the 0.75 m collision sphere's footprint,
++    so what you see matches what the sensors avoid. Returns (verts, normals, tris).
++      deciduous: lumpy, slightly squashed sphere
++      conifer:   three stacked 8-sided cones
++    """
++    rng = random.Random(seed)
++    if kind == "conifer":
++        verts, tris = [], []
++        tiers = [(-0.75, 0.80, 0.80), (-0.25, 0.62, 0.70), (0.20, 0.42, 0.65)]   # (base z, radius, height)
++        sides = 8
++        for z0, r, h in tiers:
++            base = len(verts)
++            rot = rng.uniform(0, math.pi)
++            verts.append((0.0, 0.0, z0 + h))
++            for k in range(sides):
++                a = rot + 2 * math.pi * k / sides
++                verts.append((r * math.cos(a), r * math.sin(a), z0))
++            verts.append((0.0, 0.0, z0))
++            for k in range(sides):
++                p, q = base + 1 + k, base + 1 + (k + 1) % sides
++                tris.append((base, p, q))                       # side
++                tris.append((base + sides + 1, q, p))           # underside
++        return _flat(verts, tris)
++    v, f = _ICO
++    jit = [radius * rng.uniform(0.82, 1.0) for _ in v]
++    verts = [(p[0] * j, p[1] * j, p[2] * j * 0.85) for p, j in zip(v, jit)]
++    return _flat(verts, f)
++
++
++def tree_colours(kind, seed):
++    rng = random.Random(seed * 7 + 3)
++    if kind == "conifer":
++        g = (0.12 + rng.uniform(-0.03, 0.03), 0.32 + rng.uniform(-0.05, 0.04), 0.16 + rng.uniform(-0.03, 0.03))
++    else:
++        g = (0.22 + rng.uniform(-0.06, 0.06), 0.44 + rng.uniform(-0.07, 0.06), 0.16 + rng.uniform(-0.04, 0.04))
++    trunk = (0.33 + rng.uniform(-0.04, 0.04), 0.23, 0.15)
++    return list(g) + [1.0], list(trunk) + [1.0]
+--- a/osm_world.py
++++ b/osm_world.py
+@@ -2,22 +2,29 @@
+ File Description: Turns OpenStreetMap (OSM) data around a last known position (LKP) into
+ obstacles for the existing PyBullet world, WITHOUT changing the size of the simulation map.
+ 
+-The simulation map stays exactly as it is: [-MAP_HALF, MAP_HALF] in x and y (26 m x 26 m),
+-which is what the obstacle map (object_avoidance.py), the search zones (operator_guidance.py)
+-and the probability map already assume. The LKP is placed at the centre (0, 0).
++The simulation map is [-MAP_HALF, MAP_HALF] in x and y, where MAP_HALF comes from sim_config
++(set once by main.py; 26 m x 26 m by default). The obstacle map (object_avoidance.py), the search
++zones (operator_guidance.py) and the probability map all use the same value. The LKP is placed at
++the centre (0, 0).
+ 
+   area_m  = how many REAL metres of OSM data to show across the map.
+   scale   = (2 * MAP_HALF) / area_m   (sim metres per real metre)
+ 
+-  area_m = 26  -> scale 1.0  : true size, but only a small patch around the LKP
+-  area_m = 200 -> scale 0.13 : a whole block squeezed into the same 26 m map
+-
+-What gets converted:
+-  buildings (building=*)                 -> extruded, solid footprint meshes (drone senses/avoids them)
+-  single trees (natural=tree)            -> the existing trunk + canopy trees
+-  woods / forests (natural=wood, ...)    -> trees scattered inside the polygon
+-  roads / paths (highway=*)              -> flat grey strips (visual only, no collision)
+-  water (natural=water, waterway=*)      -> flat blue surface (visual only, no collision)
++  map 26 m, area_m = 26  -> scale 1.0  : true size, but only a small patch around the LKP
++  map 26 m, area_m = 200 -> scale 0.13 : a whole block squeezed into the same 26 m map
++  map 60 m, area_m = 60  -> scale 1.0  : true size, bigger patch
++
++What gets converted (ways AND multipolygon relations):
++  buildings (building=*)                 -> extruded, solid footprint meshes (drone senses/avoids them),
++                                            textured walls by building type/material/colour + roof colour
++  single trees (natural=tree)            -> trunk + canopy trees (conifer or deciduous from leaf_type/genus)
++  woods / forests (natural=wood, ...)    -> trees scattered inside the polygon + dark forest floor
++  roads / paths / rails (highway=*, ...) -> asphalt, sidewalk, dirt-path, rail strips; yellow centre
++                                            dashes on major roads (visual only, no collision)
++  water (natural=water, waterway=*)      -> blue surfaces and streams (visual only, no collision)
++  ground (grass, park, parking, pitch,   -> coloured ground areas (visual only, no collision)
++          sand, farmland, ...)
++Only collision shapes affect sensing/navigation, and those are the same as the simple look.
+ 
+ Data sources (pick one):
+   1. Live: lat/lon -> Overpass API (cached to osm_cache/ so repeat runs work offline)
+@@ -30,9 +37,11 @@
+ import urllib.parse
+ import urllib.request
+ import xml.etree.ElementTree as ET
++import sim_config
+ 
+-MAP_HALF = 13.0                 # Must match MAP_HALF in object_avoidance.py.
+-DEFAULT_AREA_M = 2 * MAP_HALF   # Default: true scale (1 sim metre = 1 real metre).
++# Map size lives in sim_config.MAP_HALF. Read it at call time (never as a default argument,
++# which would freeze the value at import time).
++DEFAULT_AREA_M = None           # None = same as the map size, i.e. true scale (1 sim m = 1 real m).
+ 
+ # Places the drone has to reach (start + zone centres from operator_guidance.py) are kept clear,
+ # otherwise the drone could spawn inside a building or be sent to a goal it can never reach.
+@@ -45,11 +54,13 @@
+ MAX_BUILDING_HEIGHT = 8.0       # sim metres: taller than MAX_ALT (5.5 m), so the drone routes around, not over
+ 
+ WOOD_TREE_SPACING = 3.0         # sim metres between scattered trees in a wood polygon
+-MAX_TREES = 40                  # each tree = 2 bodies + ray hits; caps cost in dense forests
++MAX_TREES = 40                  # cap for the 26 m map; each tree = 2 bodies + ray hits
++MAX_TREES_LIMIT = 150           # cap never grows past this, however big the map is
+ MIN_TREE_SPACING = 1.0          # sim metres; closer trees are merged
+ 
+ ROAD_WIDTH_M = {"motorway": 12, "trunk": 10, "primary": 9, "secondary": 8, "tertiary": 7,
+-                "residential": 6, "service": 4, "unclassified": 5}
++                "residential": 6, "service": 4, "unclassified": 5, "living_street": 5,
++                "footway": 2, "steps": 2, "cycleway": 2, "path": 1.5, "track": 3}
+ DEFAULT_ROAD_WIDTH_M = 2.0      # footways, paths, tracks
+ MIN_ROAD_WIDTH = 0.3            # sim metres, so paths stay visible at small scales
+ 
+@@ -58,30 +69,42 @@
+ 
+ 
+ # ------------------------------------------------------------------ loading OSM data
+-def fetch_overpass(lat, lon, area_m, timeout=60):
++CACHE_VERSION = "v2"            # bump when the query changes, so old cached downloads are not reused
++
++
++def fetch_overpass(lat, lon, area_m=None, timeout=90):
+     """Download OSM features around (lat, lon) from Overpass, cached as JSON."""
++    area_m = sim_config.map_size() if area_m is None else area_m
+     radius = math.ceil(area_m / 2 * math.sqrt(2)) + 5      # circle that covers the whole square
+     os.makedirs(CACHE_DIR, exist_ok=True)
+-    cache = os.path.join(CACHE_DIR, f"{lat:.6f}_{lon:.6f}_{radius}.json")
++    cache = os.path.join(CACHE_DIR, f"{lat:.6f}_{lon:.6f}_{radius}_{CACHE_VERSION}.json")
+     if os.path.exists(cache):
+         with open(cache) as f:
+             return json.load(f)
+     around = f"(around:{radius},{lat},{lon})"
++    # ways AND multipolygon relations: big or complex buildings, parks and forests are often relations
+     query = f"""[out:json][timeout:{timeout}];
+ (
+   way["building"]{around};
++  relation["building"]{around};
+   node["natural"="tree"]{around};
+-  way["natural"~"wood|scrub"]{around};
+-  way["landuse"="forest"]{around};
++  way["natural"]{around};
++  relation["natural"~"^(wood|water|scrub|grassland|heath|sand|beach|bare_rock)$"]{around};
++  way["landuse"]{around};
++  relation["landuse"~"^(forest|grass|meadow|recreation_ground|village_green|cemetery|farmland|construction)$"]{around};
++  way["leisure"]{around};
++  relation["leisure"~"^(park|garden|pitch|playground|track|golf_course)$"]{around};
++  way["amenity"="parking"]{around};
++  relation["amenity"="parking"]{around};
+   way["highway"]{around};
+-  way["natural"="water"]{around};
+   way["waterway"]{around};
++  way["railway"~"^(rail|light_rail|tram|narrow_gauge)$"]{around};
+ );
+ out geom;"""
+     data = urllib.parse.urlencode({"data": query}).encode()
+     req = urllib.request.Request(OVERPASS_URL, data=data,
+                                  headers={"User-Agent": "SM2DH2C-drone-sim/1.0"})
+-    with urllib.request.urlopen(req, timeout=timeout) as resp:
++    with urllib.request.urlopen(req, timeout=timeout + 15) as resp:
+         result = json.load(resp)
+     with open(cache, "w") as f:
+         json.dump(result, f)
+@@ -89,12 +112,13 @@
+ 
+ 
+ def load_osm_file(path):
+-    """Read an Overpass JSON file or a .osm XML export into the same element format."""
++    """Read an Overpass JSON file or a .osm XML export into the same element format
++    (nodes with tags, ways with geometry, relations with member way geometry)."""
+     if path.lower().endswith(".json"):
+         with open(path) as f:
+             return json.load(f)
+     root = ET.parse(path).getroot()
+-    nodes, elements = {}, []
++    nodes, ways, elements = {}, {}, []
+     for n in root.iter("node"):
+         nodes[n.get("id")] = (float(n.get("lat")), float(n.get("lon")))
+         tags = {t.get("k"): t.get("v") for t in n.findall("tag")}
+@@ -102,12 +126,58 @@
+             elements.append({"type": "node", "lat": float(n.get("lat")),
+                              "lon": float(n.get("lon")), "tags": tags})
+     for w in root.iter("way"):
+-        geom = [nodes[nd.get("ref")] for nd in w.findall("nd") if nd.get("ref") in nodes]
++        geom = [{"lat": nodes[nd.get("ref")][0], "lon": nodes[nd.get("ref")][1]}
++                for nd in w.findall("nd") if nd.get("ref") in nodes]
++        ways[w.get("id")] = geom
+         elements.append({"type": "way", "tags": {t.get("k"): t.get("v") for t in w.findall("tag")},
+-                         "geometry": [{"lat": a, "lon": b} for a, b in geom]})
++                         "geometry": geom})
++    for r in root.iter("relation"):
++        tags = {t.get("k"): t.get("v") for t in r.findall("tag")}
++        members = [{"type": "way", "role": m.get("role", ""), "geometry": ways[m.get("ref")]}
++                   for m in r.findall("member") if m.get("type") == "way" and m.get("ref") in ways]
++        if members:
++            elements.append({"type": "relation", "tags": tags, "members": members})
+     return {"elements": elements}
+ 
+ 
++def stitch_rings(segments):
++    """Join way pieces (lists of (lat, lon)) end-to-end into closed rings. Multipolygon
++    relations often split one outline across several ways."""
++    segs = [list(s) for s in segments if len(s) >= 2]
++    rings = []
++    while segs:
++        cur = segs.pop(0)
++        joined = True
++        while cur[0] != cur[-1] and joined:
++            joined = False
++            for i, s in enumerate(segs):
++                if s[0] == cur[-1]:
++                    cur = cur + s[1:]
++                elif s[-1] == cur[-1]:
++                    cur = cur + s[::-1][1:]
++                elif s[-1] == cur[0]:
++                    cur = s[:-1] + cur
++                elif s[0] == cur[0]:
++                    cur = s[::-1][:-1] + cur
++                else:
++                    continue
++                segs.pop(i)
++                joined = True
++                break
++        if len(cur) >= 4 and cur[0] == cur[-1]:
++            rings.append(cur)
++    return rings
++
++
++def relation_outer_rings(el):
++    """Outer rings of a multipolygon relation, in the same {'lat','lon'} format as way geometry.
++    Inner rings (holes such as courtyards) are ignored: the area is drawn/solid without the hole."""
++    pieces = [[(g["lat"], g["lon"]) for g in m.get("geometry") or [] if g]
++              for m in el.get("members", [])
++              if m.get("type") == "way" and m.get("role", "") in ("outer", "")]
++    return [[{"lat": a, "lon": b} for a, b in ring] for ring in stitch_rings(pieces)]
++
++
+ # ------------------------------------------------------------------ geometry helpers
+ def make_projector(lat0, lon0, scale):
+     """lat/lon -> sim (x, y). x = east, y = north, LKP at (0, 0). Accurate to well under
+@@ -120,8 +190,9 @@
+     return to_xy
+ 
+ 
+-def clip_polygon(poly, half=MAP_HALF):
++def clip_polygon(poly, half=None):
+     """Sutherland-Hodgman clip of a polygon to the square map."""
++    half = sim_config.MAP_HALF if half is None else half
+     def clip(pts, inside, cross):
+         out = []
+         for i, cur in enumerate(pts):
+@@ -151,8 +222,9 @@
+     return pts
+ 
+ 
+-def clip_segment(a, b, half=MAP_HALF):
++def clip_segment(a, b, half=None):
+     """Liang-Barsky clip of a line segment to the square map. Returns None if fully outside."""
++    half = sim_config.MAP_HALF if half is None else half
+     t0, t1 = 0.0, 1.0
+     dx, dy = b[0] - a[0], b[1] - a[1]
+     for pp, q in ((-dx, a[0] + half), (dx, half - a[0]), (-dy, a[1] + half), (dy, half - a[1])):
+@@ -257,68 +329,240 @@
+     return max(MIN_BUILDING_HEIGHT, min(MAX_BUILDING_HEIGHT, h * scale))
+ 
+ 
++def building_info(tags, scale):
++    """Height (sim m, clamped like before) plus what the building should look like."""
++    h = building_height(tags, scale)
++    # storeys: from the tag if present, else from the real height; used for the window grid
++    try:
++        storeys = max(1, int(round(float(tags.get("building:levels")))))
++    except (TypeError, ValueError):
++        storeys = max(1, int(round(h / scale / BUILDING_LEVEL_HEIGHT)))
++    kind = tags.get("building", "yes")
++    material = str(tags.get("building:material", "")).lower()
++    if material in MATERIAL_STYLE:
++        style = MATERIAL_STYLE[material]
++    else:
++        style = next((s for s, kinds in BUILDING_STYLE_KINDS.items() if kind in kinds), "stucco")
++    return h, {"style": style, "storeys": storeys, "kind": kind,
++               "wall": tags.get("building:colour"), "roof": tags.get("roof:colour")}
++
++
++# Building type -> wall style (see visual_assets.facade_texture).
++BUILDING_STYLE_KINDS = {
++    "brick": {"university", "college", "school", "public", "civic", "government", "library",
++              "church", "chapel", "apartments", "dormitory", "train_station", "townhall"},
++    "siding": {"house", "residential", "detached", "semidetached_house", "terrace", "bungalow",
++               "cabin", "farm"},
++    "glass": {"commercial", "office", "retail", "hotel", "hospital", "supermarket"},
++    "metal": {"industrial", "warehouse", "garage", "garages", "shed", "barn", "hangar", "service",
++              "carport", "greenhouse", "roof", "storage_tank", "transportation", "parking"},
++}
++MATERIAL_STYLE = {"brick": "brick", "glass": "glass", "metal": "metal", "steel": "metal",
++                  "wood": "siding", "timber_framing": "siding", "concrete": "stucco",
++                  "plaster": "stucco", "stone": "stucco", "sandstone": "stucco"}
++
++# Flat ground surfaces: category -> (height above ground in m, RGB). Higher layers draw over lower
++# ones (4 mm apart so the GUI depth buffer doesn't flicker); all stay below the heatmap.
++SURFACE_LAYERS = {
++    "farm": (0.004, (0.66, 0.62, 0.42)),
++    "grass": (0.008, (0.40, 0.58, 0.28)),
++    "scrub": (0.012, (0.45, 0.52, 0.30)),
++    "forest": (0.016, (0.27, 0.38, 0.20)),
++    "dirt": (0.020, (0.55, 0.47, 0.36)),
++    "pitch": (0.024, (0.33, 0.60, 0.30)),
++    "track": (0.024, (0.66, 0.36, 0.28)),
++    "sand": (0.028, (0.84, 0.77, 0.58)),
++    "rock": (0.028, (0.55, 0.53, 0.50)),
++    "parking": (0.032, (0.31, 0.31, 0.33)),
++    "plaza": (0.036, (0.72, 0.70, 0.66)),
++    "water": (0.040, (0.22, 0.43, 0.70)),
++}
++# Line features: category -> (height, RGB, default real width in m)
++LINE_LAYERS = {
++    "stream": (0.044, (0.24, 0.45, 0.72), 2.0),
++    "path": (0.048, (0.60, 0.50, 0.36), 1.5),
++    "cycle": (0.052, (0.62, 0.42, 0.38), 2.0),
++    "foot": (0.056, (0.76, 0.74, 0.70), 2.0),
++    "rail": (0.060, (0.38, 0.34, 0.31), 3.0),
++    "service": (0.064, (0.30, 0.30, 0.32), 4.0),
++    "minor": (0.068, (0.26, 0.26, 0.28), 6.0),
++    "major": (0.072, (0.22, 0.22, 0.24), 8.0),
++}
++MARKING_Z, MARKING_RGB = 0.076, (0.92, 0.78, 0.20)      # yellow centre dashes on major roads
++
++HIGHWAY_CATEGORY = {
++    **{k: "major" for k in ("motorway", "trunk", "primary", "secondary", "tertiary", "motorway_link",
++                            "trunk_link", "primary_link", "secondary_link", "tertiary_link")},
++    **{k: "minor" for k in ("residential", "unclassified", "living_street", "road")},
++    "service": "service",
++    **{k: "foot" for k in ("footway", "pedestrian", "steps", "corridor", "sidewalk", "crossing")},
++    "cycleway": "cycle",
++    **{k: "path" for k in ("path", "track", "bridleway")},
++}
++WATERWAY_WIDTH_M = {"river": 10.0, "canal": 6.0, "stream": 2.0, "ditch": 1.0, "drain": 1.0}
++CONIFER_GENUS = {"pinus", "picea", "abies", "pseudotsuga", "thuja", "tsuga", "sequoia",
++                 "sequoiadendron", "cedrus", "juniperus", "larix", "taxus", "calocedrus", "chamaecyparis"}
++
++
++def surface_category(tags):
++    """Which flat ground surface an area represents, or None (e.g. landuse=residential is a zoning
++    area, not a surface, so it is not drawn)."""
++    lu, le, na, am = (tags.get(k) for k in ("landuse", "leisure", "natural", "amenity"))
++    if na == "water" or lu in ("reservoir", "basin") or tags.get("water"):
++        return "water"
++    if am == "parking":
++        return "parking"
++    if le == "track":
++        return "track"
++    if le == "pitch":
++        return "pitch"
++    if le == "playground" or na in ("sand", "beach"):
++        return "sand"
++    if na in ("bare_rock", "scree"):
++        return "rock"
++    if lu == "forest" or na == "wood":
++        return "forest"
++    if na in ("scrub", "heath"):
++        return "scrub"
++    if lu in ("farmland", "farmyard", "orchard", "vineyard", "allotments"):
++        return "farm"
++    if (lu in ("grass", "meadow", "village_green", "recreation_ground", "cemetery")
++            or le in ("park", "garden", "golf_course", "common", "dog_park") or na == "grassland"):
++        return "grass"
++    if lu in ("construction", "brownfield", "landfill"):
++        return "dirt"
++    if (tags.get("highway") in ("pedestrian", "footway") and tags.get("area") == "yes") \
++            or tags.get("place") == "square" or am == "marketplace":
++        return "plaza"
++    return None
++
++
++def tree_kind(tags, rng=None, mixed=0.5):
++    leaf = tags.get("leaf_type")
++    if leaf == "needleleaved" or str(tags.get("genus", "")).lower() in CONIFER_GENUS:
++        return "conifer"
++    if leaf == "broadleaved" or rng is None:
++        return "deciduous"
++    return "conifer" if rng.random() < mixed else "deciduous"
++
++
++def _point_segment_dist(pt, a, b):
++    dx, dy = b[0] - a[0], b[1] - a[1]
++    L2 = dx * dx + dy * dy
++    t = 0.0 if L2 == 0 else max(0.0, min(1.0, ((pt[0] - a[0]) * dx + (pt[1] - a[1]) * dy) / L2))
++    return math.hypot(pt[0] - a[0] - t * dx, pt[1] - a[1] - t * dy)
++
++
+ # ------------------------------------------------------------------ the parsed scene
+ class OSMScene:
+     """Everything parsed from OSM, already in sim coordinates and clipped to the map."""
+ 
+     def __init__(self):
+-        self.buildings = []     # [(polygon [(x, y), ...], height)]
++        self.scale = 1.0
++        self.buildings = []     # [(polygon [(x, y), ...], height, info dict)]
+         self.trees = []         # [(x, y)]
+-        self.roads = []         # [((x1, y1), (x2, y2), width)]
++        self.tree_kinds = []    # ["deciduous" | "conifer"], parallel to trees
++        self.roads = []         # [((x1, y1), (x2, y2), width, category)]
+         self.water = []         # [polygon]
++        self.surfaces = []      # [(polygon, category)]  grass, parking, sand, forest floor, ...
+         self.dropped = []       # human-readable notes about features removed to keep the mission valid
+ 
+     def summary(self):
+         return (f"{len(self.buildings)} buildings, {len(self.trees)} trees, "
+-                f"{len(self.roads)} road segments, {len(self.water)} water areas")
++                f"{len(self.roads)} road/path segments, {len(self.water)} water areas, "
++                f"{len(self.surfaces)} ground areas")
+ 
+ 
+ def parse_scene(osm_json, lat, lon, area_m=DEFAULT_AREA_M, keep_clear=(), seed=0):
+     """Convert OSM elements into an OSMScene that fits the fixed-size map.
+     keep_clear: (x, y) points (drone start, zone centres) that must stay reachable."""
++    MAP_HALF = sim_config.MAP_HALF
++    area_m = 2 * MAP_HALF if area_m is None else area_m
+     scale = (2 * MAP_HALF) / area_m
+     to_xy = make_projector(lat, lon, scale)
+     scene = OSMScene()
+-    woods = []
++    scene.scale = scale
++    woods = []                  # (polygon, tags) for tree scattering
++    trees = []                  # (x, y, kind, scattered?)
+     rng = random.Random(seed)
+ 
++    def add_area(pts, tags):
++        """A closed outline (from a way or a relation ring)."""
++        if len(pts) < 3:
++            return
++        if tags.get("building", "no") != "no":
++            poly = clip_polygon(pts)
++            if len(poly) >= 3 and abs(polygon_area(poly)) > 0.05:
++                h, info = building_info(tags, scale)
++                scene.buildings.append((poly, h, info))
++            return
++        cat = surface_category(tags)
++        if cat is None:
++            return
++        if cat == "forest" or tags.get("natural") == "scrub":
++            woods.append((pts, tags))
++        poly = clip_polygon(pts)
++        if len(poly) >= 3 and abs(polygon_area(poly)) > 0.01:
++            if cat == "water":
++                scene.water.append(poly)
++            else:
++                scene.surfaces.append((poly, cat))
++
++    def add_line(pts, tags):
++        if tags.get("tunnel") in ("yes", "culvert") or tags.get("layer", "0").startswith("-"):
++            return                          # underground: not visible from the air
++        if "highway" in tags:
++            cat = HIGHWAY_CATEGORY.get(tags["highway"])
++            if cat is None:
++                return                      # proposed / construction / bus_stop / ...
++            w = ROAD_WIDTH_M.get(tags["highway"], LINE_LAYERS[cat][2])
++            if tags.get("highway") == "pedestrian":
++                w = 4.0
++        elif "waterway" in tags:
++            cat, w = "stream", WATERWAY_WIDTH_M.get(tags["waterway"], 1.0)
++        elif "railway" in tags:
++            cat, w = "rail", LINE_LAYERS["rail"][2]
++        else:
++            return
++        try:
++            w = float(str(tags.get("width", "")).replace("m", "").strip())
++        except ValueError:
++            pass
++        width = max(MIN_ROAD_WIDTH, w * scale)
++        for a, b in zip(pts, pts[1:]):
++            seg = clip_segment(a, b)
++            if seg and math.hypot(seg[1][0] - seg[0][0], seg[1][1] - seg[0][1]) > 1e-3:
++                scene.roads.append((seg[0], seg[1], width, cat))
++
+     for el in osm_json.get("elements", []):
+         tags = el.get("tags", {})
+         if el["type"] == "node":
+             if tags.get("natural") == "tree":
+                 x, y = to_xy(el["lat"], el["lon"])
+                 if abs(x) <= MAP_HALF and abs(y) <= MAP_HALF:
+-                    scene.trees.append((x, y))
++                    trees.append((x, y, tree_kind(tags), False))
++            continue
++        if el["type"] == "relation":
++            if tags.get("type") not in ("multipolygon", "building", None):
++                continue
++            for ring in relation_outer_rings(el):
++                add_area(ring_to_xy(ring, to_xy), tags)
+             continue
+-        geom = el.get("geometry") or []
++        geom = [g for g in (el.get("geometry") or []) if g]
+         if len(geom) < 2:
+             continue
++        closed = len(geom) >= 4 and geom[0] == geom[-1]
+         pts = ring_to_xy(geom, to_xy)
+-
+-        if "building" in tags and len(pts) >= 3:
+-            poly = clip_polygon(pts)
+-            if len(poly) >= 3 and abs(polygon_area(poly)) > 0.05:
+-                scene.buildings.append((poly, building_height(tags, scale)))
+-        elif (tags.get("natural") in ("wood", "scrub") or tags.get("landuse") == "forest") and len(pts) >= 3:
+-            woods.append(pts)
+-        elif tags.get("natural") == "water" and len(pts) >= 3:
+-            poly = clip_polygon(pts)
+-            if len(poly) >= 3:
+-                scene.water.append(poly)
+-        elif "highway" in tags or "waterway" in tags:
+-            if "highway" in tags:
+-                w = ROAD_WIDTH_M.get(tags["highway"], DEFAULT_ROAD_WIDTH_M)
+-            else:
+-                w = 3.0 if tags["waterway"] in ("river", "canal") else 1.0
+-            width = max(MIN_ROAD_WIDTH, w * scale)
+-            for a, b in zip(pts, pts[1:]):
+-                seg = clip_segment(a, b)
+-                if seg and math.hypot(seg[1][0] - seg[0][0], seg[1][1] - seg[0][1]) > 1e-3:
+-                    scene.roads.append((seg[0], seg[1], width))
++        is_line = ("highway" in tags and tags.get("area") != "yes") or "waterway" in tags \
++            or "railway" in tags
++        if is_line:
++            add_line(pts, tags)
++        elif closed:
++            add_area(pts, tags)
+ 
+     # Scatter trees inside wood/forest polygons on a jittered grid (deterministic per seed).
+     s = WOOD_TREE_SPACING
+-    for poly in woods:
++    for poly, wtags in woods:
+         xs, ys = [q[0] for q in poly], [q[1] for q in poly]
+         x = max(min(xs), -MAP_HALF)
+         while x <= min(max(xs), MAP_HALF):
+@@ -326,48 +570,59 @@
+             while y <= min(max(ys), MAP_HALF):
+                 q = (x + rng.uniform(-0.3, 0.3) * s, y + rng.uniform(-0.3, 0.3) * s)
+                 if abs(q[0]) <= MAP_HALF and abs(q[1]) <= MAP_HALF and point_in_polygon(q, poly):
+-                    scene.trees.append(q)
++                    trees.append((q[0], q[1], tree_kind(wtags, rng), True))
+                 y += s
+             x += s
+ 
++    # Scattered trees should not stand in the middle of a road or path.
++    if scene.roads:
++        trees = [t for t in trees if not t[3] or all(
++            _point_segment_dist(t, a, b) > w / 2 + 0.3 for a, b, w, _ in scene.roads)]
++
+     # Trees must not sit inside buildings, and very close trees are merged.
+     merged = []
+-    for t in scene.trees:
+-        if any(point_in_polygon(t, b) for b, _ in scene.buildings):
++    for t in trees:
++        if any(point_in_polygon(t[:2], b) for b, *_ in scene.buildings):
+             continue
+         if all(math.hypot(t[0] - m[0], t[1] - m[1]) >= MIN_TREE_SPACING for m in merged):
+             merged.append(t)
+-    if len(merged) > MAX_TREES:
+-        scene.dropped.append(f"{len(merged) - MAX_TREES} trees over the MAX_TREES={MAX_TREES} cap")
+-        merged.sort(key=lambda t: math.hypot(*t))        # keep the ones nearest the LKP
+-        merged = merged[:MAX_TREES]
+-    scene.trees = merged
++    # Same tree density as the 26 m map: the cap grows with map area, up to MAX_TREES_LIMIT.
++    max_trees = min(MAX_TREES_LIMIT, int(MAX_TREES * max(1.0, sim_config.layout_scale()) ** 2))
++    if len(merged) > max_trees:
++        scene.dropped.append(f"{len(merged) - max_trees} trees over the {max_trees}-tree cap")
++        merged.sort(key=lambda t: math.hypot(t[0], t[1]))      # keep the ones nearest the LKP
++        merged = merged[:max_trees]
++    trees = merged
+ 
+     # Keep the drone start and every search-zone centre reachable.
+     for c in keep_clear:
+         kept = []
+-        for poly, h in scene.buildings:
+-            if distance_to_polygon(c, poly) < KEEP_CLEAR_RADIUS:
++        for b in scene.buildings:
++            if distance_to_polygon(c, b[0]) < KEEP_CLEAR_RADIUS:
+                 scene.dropped.append(f"building covering ({c[0]:.0f}, {c[1]:.0f})")
+             else:
+-                kept.append((poly, h))
++                kept.append(b)
+         scene.buildings = kept
+-        before = len(scene.trees)
+-        scene.trees = [t for t in scene.trees
+-                       if math.hypot(t[0] - c[0], t[1] - c[1]) >= KEEP_CLEAR_RADIUS + TREE_CLEAR_RADIUS]
+-        if len(scene.trees) < before:
+-            scene.dropped.append(f"{before - len(scene.trees)} tree(s) near ({c[0]:.0f}, {c[1]:.0f})")
++        before = len(trees)
++        trees = [t for t in trees
++                 if math.hypot(t[0] - c[0], t[1] - c[1]) >= KEEP_CLEAR_RADIUS + TREE_CLEAR_RADIUS]
++        if len(trees) < before:
++            scene.dropped.append(f"{before - len(trees)} tree(s) near ({c[0]:.0f}, {c[1]:.0f})")
++    scene.trees = [(t[0], t[1]) for t in trees]
++    scene.tree_kinds = [t[2] for t in trees]
+     return scene
+ 
+ 
+ def is_free(scene, xy, margin=1.0):
+     """True if xy is outside every building (by margin) and away from every tree trunk."""
+-    return (all(distance_to_polygon(xy, b) >= margin for b, _ in scene.buildings)
++    return (all(distance_to_polygon(xy, b[0]) >= margin for b in scene.buildings)
+             and all(math.hypot(xy[0] - t[0], xy[1] - t[1]) >= margin for t in scene.trees))
+ 
+ 
+-def nearest_free_point(scene, xy, margin=1.0, step=0.5, max_r=MAP_HALF - 1):
++def nearest_free_point(scene, xy, margin=1.0, step=0.5, max_r=None):
+     """Spiral outward from xy until a free spot inside the map is found."""
++    MAP_HALF = sim_config.MAP_HALF
++    max_r = MAP_HALF - 1 if max_r is None else max_r
+     if is_free(scene, xy, margin):
+         return xy
+     r = step
+@@ -382,35 +637,50 @@
+ 
+ 
+ # ------------------------------------------------------------------ PyBullet bodies
+-def build_bodies(scene):
+-    """Create PyBullet bodies for buildings (solid), roads and water (visual only).
+-    Trees are NOT built here: env_sim.build_world builds them from OBSTACLE_POSITIONS
+-    exactly like the original hand-placed trees. Returns the solid body ids."""
+-    import pybullet as p
++LOW_SPECULAR = [0.04, 0.04, 0.04]   # PyBullet's default specular makes everything look like plastic
++
+ 
++def _mesh_bodies(p, builder, rgb, alpha=1.0):
++    """One visual-only body per mesh chunk (no collision: rays and sensors ignore them)."""
++    for v, n, uv, i in builder.meshes():
++        vis = p.createVisualShape(p.GEOM_MESH, vertices=v, indices=i, normals=n, uvs=uv,
++                                  rgbaColor=list(rgb) + [alpha], specularColor=LOW_SPECULAR)
++        p.createMultiBody(0, -1, vis, [0, 0, 0])
++
++
++def _building_collision(p, poly, h):
++    """Solid extruded footprint (same as before): this is what the LIDAR and A* see."""
++    tris = triangulate(poly)
++    if not tris:
++        return None, None
++    n = len(poly)
++    verts = [[x, y, 0.0] for x, y in poly] + [[x, y, h] for x, y in poly]
++    idx = []
++    for a, b, c in tris:
++        idx += [a + n, b + n, c + n]                 # roof (CCW from above)
++        idx += [c, b, a]                             # floor (CW from above = facing down)
++    ccw = polygon_area(poly) > 0
++    for i in range(n):
++        j = (i + 1) % n
++        quad = (i, j, j + n, i, j + n, i + n) if ccw else (j, i, i + n, j, i + n, j + n)
++        idx += list(quad)                            # walls, facing outward
++    col = p.createCollisionShape(p.GEOM_MESH, vertices=verts, indices=idx,
++                                 flags=p.GEOM_FORCE_CONCAVE_TRIMESH)
++    return col, (verts, idx)
++
++
++def _build_simple(p, scene):
++    """The original flat-colour look (also the fallback if anything in the detailed look fails)."""
+     solid_ids = []
+-    for poly, h in scene.buildings:
+-        tris = triangulate(poly)
+-        if not tris:
++    for poly, h, *_ in scene.buildings:
++        col, mesh = _building_collision(p, poly, h)
++        if col is None:
+             continue
+-        n = len(poly)
+-        verts = [[x, y, 0.0] for x, y in poly] + [[x, y, h] for x, y in poly]
+-        idx = []
+-        for a, b, c in tris:
+-            idx += [a + n, b + n, c + n]                 # roof (CCW from above)
+-            idx += [c, b, a]                             # floor (CW from above = facing down)
+-        ccw = polygon_area(poly) > 0
+-        for i in range(n):
+-            j = (i + 1) % n
+-            quad = (i, j, j + n, i, j + n, i + n) if ccw else (j, i, i + n, j, i + n, j + n)
+-            idx += list(quad)                            # walls, facing outward
+-        col = p.createCollisionShape(p.GEOM_MESH, vertices=verts, indices=idx,
+-                                     flags=p.GEOM_FORCE_CONCAVE_TRIMESH)
+-        vis = p.createVisualShape(p.GEOM_MESH, vertices=verts, indices=idx,
++        vis = p.createVisualShape(p.GEOM_MESH, vertices=mesh[0], indices=mesh[1],
+                                   rgbaColor=[0.62, 0.58, 0.55, 1])
+         solid_ids.append(p.createMultiBody(0, col, vis, [0, 0, 0]))
+ 
+-    for a, b, width in scene.roads:
++    for a, b, width, *_ in scene.roads:
+         length = math.hypot(b[0] - a[0], b[1] - a[1])
+         vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[length / 2, width / 2, 0.005],
+                                   rgbaColor=[0.35, 0.35, 0.35, 1])
+@@ -428,3 +698,123 @@
+                                   rgbaColor=[0.2, 0.45, 0.85, 0.85])
+         p.createMultiBody(0, -1, vis, [0, 0, 0])
+     return solid_ids
++
++
++def _build_detailed(p, scene):
++    import visual_assets as va
++    solid_ids = []
++    textures = {}
++
++    # --- ground surfaces (grass, parking, sand, forest floor, water ...), merged per category
++    try:
++        _detailed_ground(p, va, scene)
++    except Exception as exc:
++        print("  ground areas drawn simple:", exc)
++        _build_simple(p, _only(scene, water=True))
++    try:
++        _detailed_lines(p, va, scene)
++    except Exception as exc:
++        print("  roads drawn simple:", exc)
++        _build_simple(p, _only(scene, roads=True))
++    _detailed_buildings(p, va, scene, solid_ids, textures)
++    return solid_ids
++
++
++def _only(scene, water=False, roads=False):
++    """Copy of the scene holding just one feature type (for the simple-look fallback)."""
++    part = OSMScene()
++    part.water = list(scene.water) if water else []
++    part.roads = list(scene.roads) if roads else []
++    return part
++
++
++def _detailed_ground(p, va, scene):
++    by_cat = {}
++    for poly, cat in scene.surfaces:
++        by_cat.setdefault(cat, []).append(poly)
++    by_cat.setdefault("water", []).extend(scene.water)
++    for cat, polys in by_cat.items():
++        z, rgb = SURFACE_LAYERS[cat]
++        mb = va.MeshBuilder()
++        for poly in polys:
++            mb.add_flat_polygon(va.simplify(poly, 0.03), z, triangulate)
++        _mesh_bodies(p, mb, rgb, alpha=0.92 if cat == "water" else 1.0)
++
++
++def _detailed_lines(p, va, scene):
++    """Roads, paths, rails, streams: merged strips with round joints; dashes on major roads."""
++    by_cat = {}
++    marks = va.MeshBuilder()
++    dash = max(0.25, 3.0 * scene.scale)
++    line_w = max(0.05, 0.15 * scene.scale)
++    for a, b, width, cat in scene.roads:
++        by_cat.setdefault(cat, va.MeshBuilder()).add_strip(a, b, width, LINE_LAYERS[cat][0])
++        if cat == "major" and width >= 4 * line_w:
++            L = math.hypot(b[0] - a[0], b[1] - a[1])
++            d = 0.0
++            while d + dash <= L:
++                p0 = (a[0] + (b[0] - a[0]) * d / L, a[1] + (b[1] - a[1]) * d / L)
++                p1 = (a[0] + (b[0] - a[0]) * (d + dash) / L, a[1] + (b[1] - a[1]) * (d + dash) / L)
++                marks.add_strip(p0, p1, line_w, MARKING_Z)
++                d += 3 * dash
++    for cat, mb in by_cat.items():
++        _mesh_bodies(p, mb, LINE_LAYERS[cat][1])
++    _mesh_bodies(p, marks, MARKING_RGB)
++
++
++def _detailed_buildings(p, va, scene, solid_ids, textures):
++    """Same solid collision mesh as before + textured walls (window per storey) + coloured roof."""
++    for poly, h, info in scene.buildings:
++        col, mesh = _building_collision(p, poly, h)
++        if col is None:
++            continue
++        body = None
++        try:
++            style = info.get("style", "stucco")
++            wall_rgb = va.parse_colour(info.get("wall")) or va.STYLE_WALL[style]
++            roof_rgb = va.parse_colour(info.get("roof")) or va.STYLE_ROOF[style]
++            storey_h = h / max(1, info.get("storeys", 1))
++            vpoly, tol = poly, 0.02           # visual outline: simplify very detailed footprints
++            while 4 * len(vpoly) > va.MAX_VERTS and tol < 2.0:
++                vpoly, tol = va.simplify(poly, tol), tol * 2
++            v, n, uv, t = va.wall_mesh(vpoly, h, bay_w=storey_h, storey_h=storey_h)
++            if len(v) > va.MAX_VERTS:
++                raise ValueError("building outline too detailed for one mesh")
++            vis = p.createVisualShape(p.GEOM_MESH, vertices=[list(q) for q in v],
++                                      indices=[i for tri in t for i in tri],
++                                      normals=[list(q) for q in n], uvs=[list(q) for q in uv],
++                                      rgbaColor=[1, 1, 1, 1], specularColor=LOW_SPECULAR)
++            body = p.createMultiBody(0, col, vis, [0, 0, 0])
++            key = (style, tuple(round(c, 2) for c in wall_rgb))
++            if key not in textures:
++                textures[key] = p.loadTexture(va.facade_texture(style, wall_rgb))
++            p.changeVisualShape(body, -1, textureUniqueId=textures[key])
++            roof = va.MeshBuilder()
++            roof.add_flat_polygon(va.ensure_ccw(vpoly), h + 0.003, triangulate)
++            _mesh_bodies(p, roof, roof_rgb)
++        except Exception as exc:                                   # keep the building, plain look
++            print("  building drawn plain:", exc)
++            if body is None:                                       # failed before the body existed
++                vis = p.createVisualShape(p.GEOM_MESH, vertices=mesh[0], indices=mesh[1],
++                                          rgbaColor=[0.62, 0.58, 0.55, 1])
++                body = p.createMultiBody(0, col, vis, [0, 0, 0])
++            else:                                                  # body exists; texture/roof failed
++                try:
++                    p.changeVisualShape(body, -1, rgbaColor=[0.62, 0.58, 0.55, 1])
++                except Exception:
++                    pass
++        solid_ids.append(body)
++
++
++def build_bodies(scene, detailed=True):
++    """Create PyBullet bodies for buildings (solid) and ground features (visual only).
++    Trees are NOT built here: env_sim.build_world builds them from OBSTACLE_POSITIONS.
++    detailed=False gives the original flat-colour look. Returns the solid body ids.
++    Collision shapes are identical in both modes, so sensing and navigation do not change."""
++    import pybullet as p
++    if detailed:
++        try:
++            return _build_detailed(p, scene)
++        except ImportError as exc:                     # visual_assets.py missing / numpy missing
++            print("Detailed OSM visuals unavailable, using the simple look:", exc)
++    return _build_simple(p, scene)
+--- a/env_sim.py
++++ b/env_sim.py
+@@ -9,6 +9,7 @@
+ import pybullet as p
+ import pybullet_data
+ import osm_world
++import sim_config
+ 
+ # Static positions of drone, obstacle, and target in the simulated environment.
+ # Positions are (x , y, z) in the PyBullet world.
+@@ -31,11 +32,36 @@
+ # Set by use_osm(); None means the original hand-placed world.
+ OSM_SCENE = None
+ 
++# Detailed visuals (textured buildings, tree models, coloured ground, sky, shadows). main.py turns
++# this off with --simple-visuals. Visual only: collision shapes are identical either way.
++DETAILED_VISUALS = True
++# Tree model per entry of OBSTACLE_POSITIONS ("deciduous" or "conifer"); use_osm() replaces it.
++TREE_KINDS = ["deciduous", "conifer", "deciduous", "conifer",
++              "conifer", "deciduous", "deciduous", "conifer"]
++SKY_OPTIONS = "--background_color_red=0.62 --background_color_green=0.76 --background_color_blue=0.92"
++LOW_SPECULAR = [0.04, 0.04, 0.04]
+ 
+-def use_osm(lat, lon, area_m=osm_world.DEFAULT_AREA_M, osm_file=None, keep_clear=(), seed=0):
++
++def scale_layout(k):
++    """
++    Stretch the hand-placed layout (drone start, trees, target, flight path) by factor k in x and y,
++    so it fills a map that is k times the original 26 m. Heights (z) are unchanged.
++    Call ONCE, after sim_config.set_map_size() and BEFORE use_osm() / build_world().
++
++    Lists are updated IN PLACE, so modules that imported them (object_avoidance.py,
++    target_detection.py, main.py) see the scaled values, the same way use_osm() works.
++    """
++    if k == 1.0:
++        return
++    for pt in [DRONE_START_POS, TARGET_POSITION, *OBSTACLE_POSITIONS, *FLIGHT_PATH]:
++        pt[0], pt[1] = round(pt[0] * k, 3), round(pt[1] * k, 3)
++
++
++def use_osm(lat, lon, area_m=None, osm_file=None, keep_clear=(), seed=0):
+     """
+     Replace the hand-placed trees with real OSM features around the last known position (lat, lon).
+-    The map size does not change: area_m real metres are fitted into the same 26 m x 26 m map.
++    area_m real metres are fitted into the sim map (sim_config.map_size(), 26 m by default).
++    area_m=None means true scale (area_m = map size).
+     Call this BEFORE build_world() and MissingPerson.spawn().
+     keep_clear: (x, y) points that must stay reachable (search-zone centres); the drone start is always added.
+ 
+@@ -44,16 +70,19 @@
+     without any changes.
+     """
+     global OSM_SCENE
++    area_m = sim_config.map_size() if area_m is None else area_m
+     data = osm_world.load_osm_file(osm_file) if osm_file else osm_world.fetch_overpass(lat, lon, area_m)
+     clear = [tuple(DRONE_START_POS[:2])] + [tuple(c) for c in keep_clear]
+     OSM_SCENE = osm_world.parse_scene(data, lat, lon, area_m, keep_clear=clear, seed=seed)
+ 
+     OBSTACLE_POSITIONS[:] = [[x, y, 0.5] for x, y in OSM_SCENE.trees]
++    TREE_KINDS[:] = OSM_SCENE.tree_kinds
+     tx, ty = osm_world.nearest_free_point(OSM_SCENE, tuple(TARGET_POSITION[:2]), margin=1.2)
+     TARGET_POSITION[0], TARGET_POSITION[1] = tx, ty
+ 
+-    print(f"OSM world at LKP ({lat}, {lon}), {area_m:.0f} m shown across the 26 m map "
+-          f"(scale {2 * osm_world.MAP_HALF / area_m:.3f}): {OSM_SCENE.summary()}")
++    print(f"OSM world at LKP ({lat}, {lon}), {area_m:.0f} m shown across the "
++          f"{sim_config.map_size():.0f} m map (scale {sim_config.map_size() / area_m:.3f}): "
++          f"{OSM_SCENE.summary()}")
+     for note in OSM_SCENE.dropped:
+         print("  removed to keep mission valid:", note)
+     print(f"  target placed at ({tx}, {ty})")
+@@ -69,7 +98,11 @@
+     """
+     assets = assets or os.path.dirname(os.path.abspath(__file__))
+     # Start PyBullet: GUI = window to watch simulation, DIRECT = no window
+-    p.connect(p.GUI if gui else p.DIRECT) 
++    if gui:
++        p.connect(p.GUI, options=SKY_OPTIONS if DETAILED_VISUALS else "")
++        p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0)   # build faster, no flicker
++    else:
++        p.connect(p.DIRECT)
+     # PyBullet searchs built-in models, including plane.urdf used for the floor_id.
+     p.setAdditionalSearchPath(pybullet_data.getDataPath())
+     p.setGravity(0, 0, -9.81) 
+@@ -92,20 +125,74 @@
+     # Intialize obstacle trees. Each tree has 2 separate fixed bodies (trunk and canopy).
+     # Tree is manually created, and have a collision shape so they are detectable. 
+     obstacle_ids = []
+-    for x, y, z in OBSTACLE_POSITIONS:
++    for k, (x, y, z) in enumerate(OBSTACLE_POSITIONS):
++        kind = TREE_KINDS[k] if k < len(TREE_KINDS) else "deciduous"
++        # Collision shapes are the same in every mode: this is what the LIDAR and camera rays hit.
+         tc = p.createCollisionShape(p.GEOM_CYLINDER, radius=0.2, height=2.5)
+-        tv = p.createVisualShape(p.GEOM_CYLINDER, radius=0.2, length=2.5, rgbaColor=[0.4, 0.2, 0.05, 1])
+-        obstacle_ids.append(p.createMultiBody(0, tc, tv, [x, y, z]))
+         lc = p.createCollisionShape(p.GEOM_SPHERE, radius=0.75)
+-        lv = p.createVisualShape(p.GEOM_SPHERE, radius=0.75, rgbaColor=[0.1, 0.45, 0.1, 1])
+-        obstacle_ids.append(p.createMultiBody(0, lc, lv, [x, y, z + 1.75]))
++        tv, lv = _tree_visuals(kind, k) if DETAILED_VISUALS else (None, None)
++        if tv is None:
++            tv = p.createVisualShape(p.GEOM_CYLINDER, radius=0.2, length=2.5, rgbaColor=[0.4, 0.2, 0.05, 1])
++            lv = p.createVisualShape(p.GEOM_SPHERE, radius=0.75, rgbaColor=[0.1, 0.45, 0.1, 1])
++        obstacle_ids.append(p.createMultiBody(0, tc, tv, [x, y, z]))
++        canopy_orn = p.getQuaternionFromEuler([0, 0, (k * 2.399) % (2 * 3.14159)])   # vary each tree
++        obstacle_ids.append(p.createMultiBody(0, lc, lv, [x, y, z + 1.75], canopy_orn))
+ 
+-    # OSM buildings (solid, sensed by the drone's ray scan) plus roads/water (visual only).
++    # OSM buildings (solid, sensed by the drone's ray scan) plus roads/water/ground (visual only).
+     if OSM_SCENE is not None:
+-        obstacle_ids += osm_world.build_bodies(OSM_SCENE)
++        obstacle_ids += osm_world.build_bodies(OSM_SCENE, detailed=DETAILED_VISUALS)
+ 
++    if gui:
++        if DETAILED_VISUALS:
++            _scene_look(floor_id)
++        p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
+     return floor_id, drone_id, obstacle_ids
+ 
+ 
++def _tree_visuals(kind, seed):
++    """Low-poly trunk + canopy visual shapes, or (None, None) if they can't be made."""
++    try:
++        import visual_assets as va
++        leaf_rgba, trunk_rgba = va.tree_colours(kind, seed)
++        trunk = p.createVisualShape(p.GEOM_CYLINDER, radius=0.13, length=2.5, rgbaColor=trunk_rgba,
++                                    specularColor=LOW_SPECULAR)
++        v, n, t = va.tree_canopy_mesh(kind, seed)
++        canopy = p.createVisualShape(p.GEOM_MESH, vertices=[list(q) for q in v],
++                                     indices=[i for tri in t for i in tri],
++                                     normals=[list(q) for q in n], rgbaColor=leaf_rgba,
++                                     specularColor=LOW_SPECULAR)
++        if trunk < 0 or canopy < 0:
++            return None, None
++        return trunk, canopy
++    except Exception as exc:
++        print("Tree model not available, using simple tree:", exc)
++        return None, None
++
++
++def _scene_look(floor_id):
++    """Shadows, sun position, matte ground, and hide the camera-preview panels (GUI only)."""
++    for name, value in (("COV_ENABLE_SHADOWS", 1), ("COV_ENABLE_RGB_BUFFER_PREVIEW", 0),
++                        ("COV_ENABLE_DEPTH_BUFFER_PREVIEW", 0),
++                        ("COV_ENABLE_SEGMENTATION_MARK_PREVIEW", 0)):
++        if hasattr(p, name):
++            try:
++                p.configureDebugVisualizer(getattr(p, name), value)
++            except Exception:
++                pass
++    half = sim_config.MAP_HALF
++    try:   # newer PyBullet: shadow map sized to the map so every building casts a shadow
++        p.configureDebugVisualizer(lightPosition=[-0.8 * half, 0.5 * half, 2.5 * half],
++                                   shadowMapResolution=4096, shadowMapWorldSize=int(3 * half))
++    except Exception:
++        try:
++            p.configureDebugVisualizer(lightPosition=[-0.8 * half, 0.5 * half, 2.5 * half])
++        except Exception:
++            pass
++    try:
++        p.changeVisualShape(floor_id, -1, specularColor=LOW_SPECULAR)
++    except Exception:
++        pass
++
++
+ if __name__ == "__main__":
+     print("Run main.py to launch the integrated simulation.")
+--- a/main.py
++++ b/main.py
+@@ -4,6 +4,15 @@
+      python main.py --profile        (GUI; prints per-section timings every 5 s)
+      python main.py --lat 45.5122 --lon -122.6587 --area 120   (OSM world around a last known position)
+      python main.py --osm-file map.osm --lat 45.5122 --lon -122.6587  (offline, from an OSM export)
++     python main.py --area 40                  (40 m x 40 m search map; layout and zones stretch to fit)
++     python main.py --lat 45.5122 --lon -122.6587 --area 300 --map-size 60
++                                               (300 real m of OSM squeezed into a 60 m map)
++     python main.py --simple-visuals           (flat colours, no textures/tree models/shadows: faster)
++
++Search-area size:
++  --area      how much ground the search covers, in real metres (MIN_AREA_M..MAX_AREA_M in sim_config).
++              The sim map follows it 1:1 (true scale) up to MAX_MAP_SIZE; bigger areas are squeezed.
++  --map-size  optional override for the sim map width (MIN_MAP_SIZE..MAX_MAP_SIZE).
+ """
+ import argparse
+ import contextlib
+@@ -11,11 +20,11 @@
+ import time
+ import pybullet as p
+ import env_sim
++import sim_config
+ from env_sim import build_world, FLIGHT_PATH, DRONE_START_POS, OBSTACLE_POSITIONS
+ from object_avoidance import Navigator, DT
+ from target_detection import MissingPerson, SearchMonitor
+-from operator_guidance import Mission, Cmd, ZONES
+-from osm_world import MAP_HALF
++from operator_guidance import Mission, Cmd, ZONES, scale_zones
+ from probability_map import ProbabilityMap
+ 
+ # Mission logic (navigation, detection, probability map) still advances every DT (240 Hz).
+@@ -73,9 +82,10 @@
+     pts = [DRONE_START_POS] + list(OBSTACLE_POSITIONS) + list(FLIGHT_PATH)
+     xs = [pt[0] for pt in pts]
+     ys = [pt[1] for pt in pts]
+-    # Clamped to the fixed map, so OSM trees near the edge never grow the search area.
+-    return ((max(min(xs) - margins, -MAP_HALF), min(max(xs) + margins, MAP_HALF)),
+-            (max(min(ys) - margins, -MAP_HALF), min(max(ys) + margins, MAP_HALF)))
++    # Clamped to the map, so OSM trees near the edge never grow the search area past it.
++    half = sim_config.MAP_HALF
++    return ((max(min(xs) - margins, -half), min(max(xs) + margins, half)),
++            (max(min(ys) - margins, -half), min(max(ys) + margins, half)))
+     # Creates a border w/ padding (3m)
+ 
+ def set_destination(nav, xy):
+@@ -97,20 +107,56 @@
+ def main():
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--headless", action="store_true")
+-    parser.add_argument("--max-time", type=float, default=240)
++    parser.add_argument("--max-time", type=float, default=None,
++                        help="sim time limit in s (default 240, scaled up with map size)")
+     parser.add_argument("--profile", action="store_true",
+                         help="print per-section timings every 5 s (GUI mode)")
+     parser.add_argument("--lat", type=float, help="last known position latitude (enables OSM world)")
+     parser.add_argument("--lon", type=float, help="last known position longitude")
+-    parser.add_argument("--area", type=float, default=26.0,
+-                        help="real metres of OSM data fitted into the 26 m map (26 = true scale)")
++    parser.add_argument("--area", type=float, default=None,
++                        help=f"width of the search area in real metres "
++                             f"({sim_config.MIN_AREA_M:g}-{sim_config.MAX_AREA_M:g}, default "
++                             f"{sim_config.BASE_MAP_SIZE:g}); sets the map size and the OSM area")
++    parser.add_argument("--map-size", type=float, default=None,
++                        help=f"override the sim map width in metres "
++                             f"({sim_config.MIN_MAP_SIZE:g}-{sim_config.MAX_MAP_SIZE:g})")
+     parser.add_argument("--osm-file", help="Overpass .json or .osm export to use instead of downloading")
+     parser.add_argument("--seed", type=int, default=0, help="seed for trees scattered in woods")
++    parser.add_argument("--simple-visuals", action="store_true",
++                        help="flat colours instead of textured buildings, tree models, sky and "
++                             "shadows (faster on slow computers; sensing/navigation identical)")
+     args = parser.parse_args()
+     if (args.lat is None) != (args.lon is None):
+         parser.error("--lat and --lon must be given together")
++    if args.osm_file and args.lat is None:
++        parser.error("--osm-file needs --lat and --lon (the last known position)")
++
++    # ---- Search-area size: validate, then size everything BEFORE any world object is built.
++    area = sim_config.BASE_MAP_SIZE if args.area is None else args.area
++    if not sim_config.MIN_AREA_M <= area <= sim_config.MAX_AREA_M:
++        parser.error(f"--area must be between {sim_config.MIN_AREA_M:g} and "
++                     f"{sim_config.MAX_AREA_M:g} m (got {area:g})")
++    if args.map_size is not None:
++        if not sim_config.MIN_MAP_SIZE <= args.map_size <= sim_config.MAX_MAP_SIZE:
++            parser.error(f"--map-size must be between {sim_config.MIN_MAP_SIZE:g} and "
++                         f"{sim_config.MAX_MAP_SIZE:g} m (got {args.map_size:g})")
++        map_size = args.map_size
++    else:
++        map_size = sim_config.clamp_map_size(area)      # true scale until MAX_MAP_SIZE
++    sim_config.set_map_size(map_size)
++    k = sim_config.layout_scale()
++    env_sim.scale_layout(k)                             # start, trees, target, flight path
++    scale_zones(k)                                      # zone centres A-D
++    max_time = args.max_time if args.max_time is not None else 240.0 * max(1.0, k)
++    if args.lat is not None:
++        print(f"Map {map_size:g} m x {map_size:g} m showing {area:g} real m of OSM data "
++              f"(scale {map_size / area:.3f}); zones {ZONES}")
++    else:
++        print(f"Map {map_size:g} m x {map_size:g} m (hand-placed layout x{k:.2f}); zones {ZONES}")
++
++    env_sim.DETAILED_VISUALS = not args.simple_visuals
+     if args.lat is not None:
+-        env_sim.use_osm(args.lat, args.lon, args.area, args.osm_file,
++        env_sim.use_osm(args.lat, args.lon, area, args.osm_file,
+                         keep_clear=list(ZONES.values()), seed=args.seed)
+     gui = not args.headless
+     render_every = RENDER_EVERY if gui else 1       # headless: no GUI calls, nothing to decimate
+@@ -129,7 +175,10 @@
+     x_range, y_range = search_bounds()
+     print("Search area:", x_range, y_range)
+     # pod is a per-second detection chance while a cell is in the camera view.
+-    belief = ProbabilityMap(x_range=x_range, y_range=y_range, pod=0.65)
++    # Keep the heatmap around 30 x 30 tiles: each tile is a PyBullet body, so 1 m cells on a
++    # 60 m map (3600 bodies) would make startup and the GUI slow.
++    cell = max(1.0, max(x_range[1] - x_range[0], y_range[1] - y_range[0]) / 30.0)
++    belief = ProbabilityMap(x_range=x_range, y_range=y_range, cell_size=cell, pod=0.65)
+     if gui:
+         # Build all heatmap tiles once, up front, with rendering off so there is no
+         # mid-mission freeze when the first tiles are created.
+@@ -147,17 +196,20 @@
+     yaw = 0.0
+     previous_xy = nav.pos[:2]
+     start_button = None
++    heat_button = None
+     buttons = {}
+     last = {}
+     status_id = None
++    hud_pos = [-sim_config.MAP_HALF + 2, sim_config.MAP_HALF - 2, 5]   # top-left corner of the map
+     last_info = None
+     step_count = 0
+     cam_pos = list(nav.pos)              # smoothed chase-camera target
+     if gui:
+         start_button = p.addUserDebugParameter("START MISSION", 1, 0, 0)
+         buttons = {cmd: p.addUserDebugParameter(cmd.value, 1, 0, 0) for cmd in Cmd}
++        heat_button = p.addUserDebugParameter("Show / hide heatmap", 1, 0, 0)
+         last = {button: p.readUserDebugParameter(button)
+-                for button in [start_button, *buttons.values()]}
++                for button in [start_button, heat_button, *buttons.values()]}
+     else:
+         mission.start()
+         set_destination(nav, mission.destination)
+@@ -165,7 +217,7 @@
+     next_tick = time.perf_counter()      # deadline for the next render tick (GUI pacing)
+     tick_t0 = next_tick                  # start of the current tick, for the profiler
+     try:
+-        while p.isConnected() and nav.t < args.max_time:
++        while p.isConnected() and nav.t < max_time:
+             render = step_count % render_every == 0
+ 
+             # Operator buttons. A slider keeps its value, so polling at 20 Hz loses nothing
+@@ -180,6 +232,10 @@
+                             set_destination(nav, mission.destination)
+                         else:
+                             mission.start()
++                    heat_value = p.readUserDebugParameter(heat_button)
++                    if heat_value != last[heat_button]:
++                        last[heat_button] = heat_value
++                        belief.set_heatmap_visible(not belief.heatmap_visible)
+                     for cmd, button in buttons.items():
+                         value = p.readUserDebugParameter(button)
+                         if value != last[button]:
+@@ -266,7 +322,7 @@
+                             kw = {"textColorRGB": [1, 1, 0], "textSize": 1.3}
+                             if status_id is not None:
+                                 kw["replaceItemUniqueId"] = status_id
+-                            status_id = p.addUserDebugText(info, [-11, 11, 5], **kw)
++                            status_id = p.addUserDebugText(info, hud_pos, **kw)
+ 
+                 # Chase camera, low-passed so tiny per-step changes in speed or direction
+                 # don't read as drone stutter.
+--- a/probability_map.py
++++ b/probability_map.py
+@@ -13,6 +13,8 @@
+ import numpy as np
+ import pybullet as p
+ 
++HEATMAP_Z = 0.10   # above the OSM ground layers (roads, grass, parking... top out at ~0.08 m)
++
+ 
+ class ProbabilityMap:
+     def __init__(self, x_range=(-12.0, 12.0), y_range=(-12.0, 12.0),
+@@ -199,7 +201,12 @@
+                 for ix in range(self.nx):
+                     self._tiles[iy, ix] = p.createMultiBody(
+                         baseMass=0, baseCollisionShapeIndex=-1, baseVisualShapeIndex=vis,
+-                        basePosition=[float(self.cx[iy, ix]), float(self.cy[iy, ix]), 0.01])
++                        basePosition=[float(self.cx[iy, ix]), float(self.cy[iy, ix]), HEATMAP_Z])
++            self._heat_alpha = alpha
++            self.heatmap_visible = True
++
++        if not self.heatmap_visible:
++            return
+ 
+         allowed = ~self.excluded
+         mean = self.grid[allowed].mean() if allowed.any() else 1.0
+@@ -217,4 +224,17 @@
+         for iy, ix in diff:
+             v = level[iy, ix] / (levels - 1)          # 0 = red, 1 = yellow
+             p.changeVisualShape(int(self._tiles[iy, ix]), -1, rgbaColor=[1.0, v, 0.0, alpha])
+-            self._tile_level[iy, ix] = level[iy, ix]   # remember per tile, not all at once
+\ No newline at end of file
++            self._tile_level[iy, ix] = level[iy, ix]   # remember per tile, not all at once
++
++    def set_heatmap_visible(self, visible):
++        """Show or hide the heatmap (operator toggle), e.g. to see the real map underneath.
++        The probability map keeps updating while hidden; showing it again repaints every tile."""
++        if not hasattr(self, "_tiles") or visible == self.heatmap_visible:
++            return
++        self.heatmap_visible = visible
++        if visible:
++            self._tile_level[:] = -1                   # force a full repaint
++            self.draw_heatmap(alpha=self._heat_alpha, budget=self._tiles.size)
++        else:
++            for tile in self._tiles.flat:
++                p.changeVisualShape(int(tile), -1, rgbaColor=[0, 0, 0, 0])
+\ No newline at end of file
+--- a/custom_drone.urdf
++++ b/custom_drone.urdf
+@@ -35,4 +35,19 @@
+     <visual><origin xyz="0 -0.04 -0.04" rpy="0 1.5708 0"/><geometry><cylinder radius="0.004" length="0.12"/></geometry><material name="dark_grey"/></visual>
+   </link>
+   <joint name="base_to_gear" type="fixed"><parent link="base_link"/><child link="landing_gear"/></joint>
++  <!-- Visual-only details: spinning-blur propeller discs and a camera gimbal (no collision). -->
++  <material name="prop_blur"><color rgba="0.1 0.1 0.1 0.35"/></material>
++  <material name="lens"><color rgba="0.05 0.08 0.12 1"/></material>
++  <link name="propellers">
++    <visual><origin xyz="0.11 0.11 0.034"/><geometry><cylinder radius="0.06" length="0.003"/></geometry><material name="prop_blur"/></visual>
++    <visual><origin xyz="0.11 -0.11 0.034"/><geometry><cylinder radius="0.06" length="0.003"/></geometry><material name="prop_blur"/></visual>
++    <visual><origin xyz="-0.11 0.11 0.034"/><geometry><cylinder radius="0.06" length="0.003"/></geometry><material name="prop_blur"/></visual>
++    <visual><origin xyz="-0.11 -0.11 0.034"/><geometry><cylinder radius="0.06" length="0.003"/></geometry><material name="prop_blur"/></visual>
++  </link>
++  <joint name="base_to_props" type="fixed"><parent link="base_link"/><child link="propellers"/></joint>
++  <link name="camera_gimbal">
++    <visual><origin xyz="0.05 0 -0.03"/><geometry><sphere radius="0.018"/></geometry><material name="dark_grey"/></visual>
++    <visual><origin xyz="0.066 0 -0.036" rpy="0 1.5708 0"/><geometry><cylinder radius="0.008" length="0.006"/></geometry><material name="lens"/></visual>
++  </link>
++  <joint name="base_to_gimbal" type="fixed"><parent link="base_link"/><child link="camera_gimbal"/></joint>
+ </robot>
