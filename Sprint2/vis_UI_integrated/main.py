@@ -10,7 +10,7 @@ Run: python main.py                  (mission setup window, then GUI; press STAR
                                                (300 real m of OSM squeezed into a 60 m map)
      python main.py --camera follow            (camera: locked | follow | free - see CAMERA_MODES)
      python main.py --simple-visuals           (flat colours, no textures/tree models/shadows: faster)
-     python main.py --resume                   (continue the last saved mission after a crash; see mission_state.py)
+     python main.py --resume                   (be able to resume the last saved mission after a crash; mission_state.py)
 
 Search-area size:
   --area      how much ground the search covers, in real metres (MIN_AREA_M..MAX_AREA_M in sim_config).
