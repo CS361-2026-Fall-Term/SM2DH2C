@@ -10,6 +10,7 @@ Run: python main.py                  (mission setup window, then GUI; press STAR
                                                (300 real m of OSM squeezed into a 60 m map)
      python main.py --camera follow            (camera: locked | follow | free - see CAMERA_MODES)
      python main.py --simple-visuals           (flat colours, no textures/tree models/shadows: faster)
+     python main.py --resume                   (continue the last saved mission after a crash; see mission_state.py)
 
 Search-area size:
   --area      how much ground the search covers, in real metres (MIN_AREA_M..MAX_AREA_M in sim_config).
@@ -30,6 +31,8 @@ from object_avoidance import Navigator, DT
 from target_detection import MissingPerson, SearchMonitor
 from operator_guidance import Mission, Cmd, ZONES, scale_zones
 from probability_map import ProbabilityMap
+from mission_state import (MissionStateStore, DEFAULT_PATH, setup_from_args,
+                           apply_setup_to_args, describe)
 
 # Mission logic (navigation, detection, probability map) still advances every DT (240 Hz).
 # Everything that talks to the PyBullet GUI (button reads, pose push, stepSimulation, camera,
@@ -192,12 +195,41 @@ def main():
                              "shadows (faster on slow computers; sensing/navigation identical)")
     parser.add_argument("--no-ui", action="store_true",
                         help="skip the mission setup window and use the command-line options")
+    parser.add_argument("--resume", action="store_true",
+                        help="continue the last saved mission (state, plan, history, drone position) "
+                             "instead of starting a new one")
+    parser.add_argument("--state-file", default=DEFAULT_PATH,
+                        help="where the mission state is saved (default: mission_state.json here)")
     args = parser.parse_args()
+
+    # ---- Saved mission state (PBI-10). With --resume the last saved state is loaded and the
+    # operator's starting information is reused, so the same world is rebuilt. Without it, any
+    # old state file is moved aside (mission_state.json.previous) and a new mission starts.
+    store = MissionStateStore(args.state_file)
+    resumed = None
+    if args.resume:
+        loaded = store.load()
+        for problem in loaded.problems:
+            print(f"[state] Skipped saved file - {problem}")
+        if loaded.payload is None:
+            print("[state] No usable saved mission found; starting a new mission.")
+        elif loaded.payload.get("setup") is None:
+            print("[state] The saved mission has no starting information; starting a new mission.")
+        else:
+            resumed = loaded.payload
+            apply_setup_to_args(args, resumed["setup"])
+            print(f"[state] Resuming saved mission ({loaded.source} file): {describe(resumed)}")
+    else:
+        old = store.load().payload
+        if old is not None and old["mission"]["state"] == "SEARCHING":
+            print("[state] An unfinished mission was saved earlier. Run with --resume to continue it; "
+                  "starting a new mission (the old file is kept as mission_state.json.previous).")
+        store.archive_previous()
 
     # ---- Mission setup window (issue #55): the operator enters the initial information here,
     # it is validated, and only then is the environment generated. Command-line values pre-fill it.
     setup_summary = None
-    if not args.headless and not args.no_ui:
+    if not args.headless and not args.no_ui and resumed is None:
         try:
             cfg = operator_setup.ask(_setup_prefill(args))
         except operator_setup.SetupUnavailable as exc:
@@ -254,6 +286,8 @@ def main():
             if tuple(centre) in scene.moved:
                 ZONES[name] = scene.moved[tuple(centre)]
         print("Zones:", ZONES)
+    # Everything about the starting setup is final now: remember it for every state save.
+    store.set_context(setup=setup_from_args(args), zones=ZONES)
     gui = not args.headless
     render_every = RENDER_EVERY if gui else 1       # headless: no GUI calls, nothing to decimate
     prof = Profiler(args.profile and gui)
@@ -291,6 +325,25 @@ def main():
     nav.route = []
     nav.state = "IDLE"
     nav.alt = 2.5
+    if resumed is not None:
+        # Put the mission back as it was saved and send the drone on its way again.
+        try:
+            note = mission.restore(resumed["mission"])
+        except ValueError as exc:                    # cannot happen after load(); belt and braces
+            print(f"[state] Saved mission could not be restored ({exc}); starting a new one.")
+        else:
+            if note:
+                print("[state] Note:", note)
+            pos = (resumed.get("drone") or {}).get("pos")
+            half = sim_config.MAP_HALF
+            if pos and abs(pos[0]) <= half and abs(pos[1]) <= half and 0.0 <= pos[2] <= 20.0:
+                nav.pos[:] = pos                     # continue from where the drone was
+            if mission.state == "SEARCHING":
+                if mission.destination:
+                    set_destination(nav, mission.destination)
+                else:
+                    nav.route = []
+                    nav.state = "DONE"
     yaw = 0.0
     previous_xy = nav.pos[:2]
     start_button = None
@@ -315,9 +368,10 @@ def main():
         # Starting view: the locked chase view, centred on the drone.
         p.resetDebugVisualizerCamera(cameraDistance=FOLLOW_VIEW[0], cameraYaw=FOLLOW_VIEW[1],
                                      cameraPitch=FOLLOW_VIEW[2], cameraTargetPosition=cam_pos)
-    else:
+    elif mission.state == "IDLE":
         mission.start()
         set_destination(nav, mission.destination)
+    store.autosave(mission, nav.pos, force=True)     # first save, so a crash right now is covered
 
     next_tick = time.perf_counter()      # deadline for the next render tick (GUI pacing)
     tick_t0 = next_tick                  # start of the current tick, for the profiler
@@ -375,17 +429,15 @@ def main():
                         if mission.destination:
                             set_destination(nav, mission.destination)
                     # A completed plan remains completed; don't restart it.
+                    # (finish() also writes the response to the history log.)
                     if nav.state == "ABORT":
-                        mission.state = "ABORT"
-                        mission.response = "Navigation aborted: awaiting operator"
+                        mission.finish("ABORT", "NAV", "Navigation aborted: awaiting operator")
                     elif nav.state == "RTL_DONE":
-                        mission.state = "COMPLETE"
-                        mission.response = "Returned to launch"
+                        mission.finish("COMPLETE", "NAV", "Returned to launch")
                     elif nav.state == "DONE" and not mission.destination:
                         target = belief.best_target(nav.pos[:2], distance_weight=0.1)
                         set_destination(nav, target)
-                        mission.state = "COMPLETE"
-                        mission.response = f'Search plan complete; person not confirmed, but most likely in cell {target}'
+                        mission.finish("COMPLETE", "NAV", f'Search plan complete; person not confirmed, but most likely in cell {target}')
 
                 else:
                     nav.t += DT
@@ -467,6 +519,9 @@ def main():
                             cameraTargetPosition=cam_pos
                         )
 
+            if render:
+                store.autosave(mission, nav.pos)     # saves right away when the mission changed
+
             step_count += 1
             if not gui and mission.state in ("FOUND", "ABORT", "COMPLETE"):
                 break
@@ -486,6 +541,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        store.autosave(mission, nav.pos, force=True)  # final save on a normal exit / Ctrl+C
         prof.report()
         print("Mission:", mission.state, "| Navigation:", nav.state)
         print("Detection:", monitor.report())

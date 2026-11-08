@@ -7,8 +7,15 @@ Note: This file only decides where the drone goes next, not how to get there (wh
 done with autonomous navigation and obstacle avoidance).
 """
 
+import math
 import time
 from enum import Enum
+
+# Every state a Mission can be in. IDLE -> SEARCHING -> FOUND / ABORT / COMPLETE.
+STATES = ("IDLE", "SEARCHING", "FOUND", "ABORT", "COMPLETE")
+# The history keeps every exchange; this cap only stops a runaway loop from growing it forever.
+HISTORY_LIMIT = 2000
+MAX_MESSAGE_LEN = 500
 
 # The center of each search zone, one zone per quadrant (Cartesian plane). 
 # Designed for the 26 m map; scale_zones() stretches them for other map sizes.
@@ -45,6 +52,8 @@ class Mission:
     found: Ends mission if target found.
     arrived: Marks zone as visited.
     handle: Apply preset operator commands.
+    finish: Ends the mission with a state and a logged message (used by main.py).
+    snapshot / restore: Save and reload the mission state (see mission_state.py, PBI-10).
     """
     def __init__(self):
         self.state = "IDLE"
@@ -63,13 +72,30 @@ class Mission:
     # Feedback from the drone to the operator, where the message is shown in the simulator UI.
     def _reply(self, cmd, msg):
         self.response = msg
-        self.history.append((round(time.time(), 2), cmd, msg)) # Message is also logged
+        self.record(cmd, msg)                                  # Message is also logged
         return msg
+
+    # Add one (timestamp, source, message) line to the history log without touching the HUD
+    # message. Every operator command and every system response ends up here (PBI-10).
+    def record(self, cmd, msg):
+        self.history.append((round(time.time(), 2), str(cmd), str(msg)))
+        if len(self.history) > HISTORY_LIMIT:
+            del self.history[:len(self.history) - HISTORY_LIMIT]
+
+    # End the mission from main.py (navigation aborted, plan complete, ...). Goes through the
+    # same logging as everything else, so these system responses are in the history too.
+    def finish(self, state, source, msg):
+        if state not in STATES:
+            raise ValueError(f"unknown mission state {state!r}")
+        self.state = state
+        return self._reply(source, msg)
 
     # Begin the mission, starts the simulation (only starts once, else error message).
     def start(self):
-        if self.state != "IDLE":
+        if self.state == "SEARCHING":
             return self._reply("START", "Rejected: mission already started")
+        if self.state != "IDLE":
+            return self._reply("START", f"Rejected: mission is {self.state} (restart the program for a new mission)")
         self.state = "SEARCHING"
         self._set_dest()
         return self._reply("START", "Mission started")
@@ -86,16 +112,23 @@ class Mission:
     # Marks the zone at the front of the plan as visited, and moves on to the next zone in plan.
     def arrived(self):
         if self.plan:
-            self.visited.append(self.plan.pop(0))
+            zone = self.plan.pop(0)
+            self.visited.append(zone)
+            self._reply("ARRIVED", f"Zone {zone} searched")
         self._set_dest()
 
     # Apply operator command by changing the current plan, and return reply message from drone.
     # Commands only accepted while drone is in "SEARCHING" state. If plan is changed (self.plan
     # is reordered or trimmed), drone re-routes.  
     def handle(self, cmd):
-        # Check whether drone state is "SEARCHING".
+        # Anything that is not a preset command is rejected with a message (never an exception).
+        name = cmd.name if isinstance(cmd, Cmd) else f"INVALID({str(cmd)[:40]})"
+        # Check whether drone state is "SEARCHING" (before START or after the mission ended,
+        # commands are rejected and logged).
         if self.state != "SEARCHING":
-            return self._reply(cmd.name, f"Rejected: mission is {self.state}")
+            return self._reply(name, f"Rejected: mission is {self.state}")
+        if not isinstance(cmd, Cmd):
+            return self._reply(name, "Rejected: unknown command")
         
         # Reported sighting, jump to Zone D, unless already searched.
         if cmd is Cmd.INVESTIGATE_D:
@@ -126,6 +159,70 @@ class Mission:
         self._set_dest()
         return self._reply(cmd.name, msg)
 
+    # ---- Saving and restoring (PBI-10) -------------------------------------------------
+    def snapshot(self):
+        """Plain-data copy of everything that makes up the mission state (JSON friendly)."""
+        return {
+            "state": self.state,
+            "plan": list(self.plan),
+            "visited": list(self.visited),
+            "destination": list(self.destination) if self.destination else None,
+            "response": self.response,
+            "history": [list(h) for h in self.history],
+        }
+
+    @staticmethod
+    def validate_snapshot(d):
+        """Raise ValueError unless d is a well-formed snapshot (e.g. read from a damaged file)."""
+        def bad(why):
+            raise ValueError(f"invalid mission snapshot: {why}")
+        if not isinstance(d, dict):
+            bad("not an object")
+        if d.get("state") not in STATES:
+            bad("unknown state")
+        for key in ("plan", "visited"):
+            zones = d.get(key)
+            if not isinstance(zones, list) or any(z not in ZONES for z in zones):
+                bad(f"{key} must be a list of known zones")
+        if len(set(d["plan"]) | set(d["visited"])) != len(d["plan"]) + len(d["visited"]):
+            bad("a zone appears twice in plan/visited")
+        dest = d.get("destination")
+        if dest is not None and not (isinstance(dest, list) and len(dest) == 2 and all(
+                isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+                for v in dest)):
+            bad("destination must be null or [x, y]")
+        if not isinstance(d.get("response"), str) or len(d["response"]) > MAX_MESSAGE_LEN:
+            bad("response must be a short string")
+        hist = d.get("history")
+        if not isinstance(hist, list) or len(hist) > HISTORY_LIMIT:
+            bad("history must be a list")
+        for h in hist:
+            if not (isinstance(h, list) and len(h) == 3
+                    and isinstance(h[0], (int, float)) and not isinstance(h[0], bool)
+                    and math.isfinite(h[0])
+                    and isinstance(h[1], str) and isinstance(h[2], str)
+                    and len(h[1]) <= MAX_MESSAGE_LEN and len(h[2]) <= MAX_MESSAGE_LEN):
+                bad("history entries must be [time, source, message]")
+
+    def restore(self, d):
+        """Load a snapshot written by snapshot(). Raises ValueError (and changes nothing) if it
+        is invalid. The destination is recomputed from the plan and the CURRENT zone centres;
+        returns a note when that differs from the saved one (e.g. the map changed), else ''."""
+        self.validate_snapshot(d)
+        self.state = d["state"]
+        self.plan = list(d["plan"])
+        self.visited = list(d["visited"])
+        self.response = d["response"]
+        self.history = [(float(t), s, m) for t, s, m in d["history"]]
+        self._set_dest()
+        note = ""
+        saved = tuple(d["destination"]) if d["destination"] else None
+        if self.state == "SEARCHING" and saved != self.destination:
+            note = f"saved destination {saved} replaced by {self.destination} (zone centres changed)"
+        self.record("RESTORE", f"Mission restored from saved state ({self.state}, "
+                               f"{len(self.visited)} zone(s) searched)")
+        return note
+
 # Tests mission logic without the simulator. Only tests this file.
 def selftest():
     m = Mission()
@@ -144,6 +241,8 @@ def selftest():
     assert "Rejected" in m.start()
     m.found()
     assert "Rejected" in m.handle(Cmd.AVOID_C)
+    assert "Rejected" in m.handle("not a command")   # odd input is rejected, never a crash
+    assert "FOUND" in m.start()                      # after the end: says why it was rejected
     print("selftest passed:", len(m.history), "events logged")
 
 if __name__ == "__main__":
