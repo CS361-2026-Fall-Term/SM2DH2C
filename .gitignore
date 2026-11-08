@@ -2,3 +2,5 @@
 __pycache__/
 spike01_results/
 osm_cache/
+mission_state.json*
+.mission_state.*.tmp
