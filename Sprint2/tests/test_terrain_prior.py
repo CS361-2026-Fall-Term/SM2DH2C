@@ -250,6 +250,15 @@ class TestInitialMap(unittest.TestCase):
         self.assertTrue((result[terrain == tp.WATER] == 0).all())
         self.assertTrue((result[terrain == tp.BUILDING] == 0).all())
 
+    def test_ac03_sidewalk_barrier_ratio(self):
+        scene = make_scene(roads=[((-10, 0.5), (-1.2, 0.5), 0.5, "foot")],        # sidewalk, west
+                           barriers=[((0.5, 1.2), (0.5, 10), "fence")])             # fence, north
+        result, _ = tp.build_initial_map(scene, self.grid, (0, 0), "hiker", 10.0)
+        sidewalk, barrier = cell_at(self.grid, -2.5, 0.5), cell_at(self.grid, 0.5, 2.5)
+        terrain = tp.terrain_grid(scene, self.grid)
+        self.assertEqual((terrain[sidewalk], terrain[barrier]), (tp.SIDEWALK, tp.BARRIER))
+        self.assertAlmostEqual(result[sidewalk] / result[barrier], 1.5 / 0.2, places=6)
+
     def test_ac04_inner_ring_higher_for_same_terrain(self):
         result, _ = tp.build_initial_map(make_scene(), self.grid, (0, 0), "hiker", 10.0)
         self.assertGreater(result[cell_at(self.grid, 0.5, 0.5)], result[cell_at(self.grid, 7.5, 0.5)])
@@ -282,6 +291,56 @@ class TestInitialMap(unittest.TestCase):
         self.assertLess(time.perf_counter() - t0, 1.0)
 
 
+MAP_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "map.osm")
+
+
+def osm_bounds(path):
+    """(min_lat, min_lon, max_lat, max_lon) of an .osm export: its <bounds> tag, or its nodes."""
+    import xml.etree.ElementTree as ET
+    root = ET.parse(path).getroot()
+    b = root.find("bounds")
+    if b is not None:
+        return tuple(float(b.get(k)) for k in ("minlat", "minlon", "maxlat", "maxlon"))
+    lats = [float(n.get("lat")) for n in root.iter("node")]
+    lons = [float(n.get("lon")) for n in root.iter("node")]
+    return min(lats), min(lons), max(lats), max(lons)
+
+
+class TestRealOsmData(unittest.TestCase):
+    """AC-02: on real OpenStreetMap data (the exported map.osm next to main.py), for 3 different
+    LKPs inside the export, every cell is >= 0 and all cells sum to 1."""
+
+    def setUp(self):
+        if not os.path.isfile(MAP_FILE):
+            self.skipTest("map.osm (an OpenStreetMap export) not found next to main.py")
+        try:
+            import osm_world
+            import sim_config
+        except ImportError:
+            self.skipTest("osm_world / sim_config not found next to terrain_prior.py")
+        self.osm_world, self.sim_config = osm_world, sim_config
+        self.data = osm_world.load_osm_file(MAP_FILE)
+        sim_config.set_map_size(60.0)
+
+    def tearDown(self):
+        if hasattr(self, "sim_config"):
+            self.sim_config.set_map_size(self.sim_config.BASE_MAP_SIZE)
+
+    def test_ac02_three_lkps(self):
+        min_lat, min_lon, max_lat, max_lon = osm_bounds(MAP_FILE)
+        lkps = [(min_lat + (max_lat - min_lat) * f, min_lon + (max_lon - min_lon) * g)
+                for f, g in ((0.5, 0.5), (0.35, 0.65), (0.65, 0.35))]
+        grid = make_grid(half=30.0, cell=2.0)                # 60 m map, 30 x 30 cells (main.py)
+        for lat, lon in lkps:
+            with self.subTest(lkp=(round(lat, 6), round(lon, 6))):
+                scene = self.osm_world.parse_scene(self.data, lat, lon, 100.0)
+                result, _ = tp.build_initial_map(scene, grid, (0, 0), "hiker", 30.0)
+                self.assertTrue((result >= 0).all())
+                self.assertAlmostEqual(result.sum(), 1.0, places=9)
+                terrain = tp.terrain_grid(scene, grid)
+                zero = (terrain == tp.WATER) | (terrain == tp.BUILDING)
+                self.assertTrue((result[zero] == 0).all())
+
+
 if __name__ == "__main__":
     unittest.main()
-    
