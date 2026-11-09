@@ -39,6 +39,9 @@ class ProbabilityMap:
 
         self.grid = np.full((self.ny, self.nx), 1.0 / (self.nx * self.ny))
         self.excluded = np.zeros_like(self.grid, dtype=bool)
+        self.prior = self.grid.copy()          # starting map; re-included zones get these values back
+        self._area_excluded = np.zeros_like(self.excluded)   # from exclude() (circles)
+        self._zone_masks = {}                  # zone name -> cells excluded for that zone
         self._last_cell = None
 
     # ---------- coordinate helpers ----------
@@ -72,8 +75,81 @@ class ProbabilityMap:
 
     def exclude(self, xy, radius):
         """Area marked 'do not search'; person assumed not there."""
-        self.excluded |= self._disk(xy, radius)
+        self._area_excluded |= self._disk(xy, radius)
+        self.excluded |= self._area_excluded
         self._normalize()
+
+    # ---------- PBI-03: initial map and zone exclusions ----------
+    def set_initial(self, matrix):
+        """Load the starting map built by terrain_prior.build_initial_map() (same shape as the
+        grid). It is kept as self.prior so a re-included zone can get its starting values back."""
+        m = np.asarray(matrix, dtype=float)
+        if m.shape != self.grid.shape:
+            raise ValueError(f"initial map shape {m.shape} does not match the grid {self.grid.shape}")
+        self.prior = m / m.sum() if m.sum() > 0 else np.full(m.shape, 1.0 / m.size)
+        self.grid = self.prior.copy()
+        self._normalize()
+
+    def _box(self, rect):
+        x0, y0, x1, y1 = rect
+        return (self.cx >= x0) & (self.cx <= x1) & (self.cy >= y0) & (self.cy <= y1)
+
+    def _refresh_excluded(self):
+        self.excluded = self._area_excluded.copy()
+        for mask in self._zone_masks.values():
+            self.excluded |= mask
+
+    def exclude_zone(self, name, rect):
+        """'Do not search' for a zone: every cell inside rect = (x0, y0, x1, y1) gets probability 0
+        until the zone is re-included. Excluding the same zone twice changes nothing."""
+        if name in self._zone_masks:
+            return
+        self._zone_masks[name] = self._box(rect)
+        self._refresh_excluded()
+        self._normalize()
+
+    def include_zone(self, name):
+        """Re-include an excluded zone: its cells get their starting (prior) values back, then the
+        map is re-normalized. Cells still excluded by another zone or area stay at 0."""
+        mask = self._zone_masks.pop(name, None)
+        if mask is None:
+            return
+        self._refresh_excluded()
+        restore = mask & ~self.excluded
+        if restore.any():
+            # Put the zone back at the same scale as the rest of the map: its starting values,
+            # sized relative to the map's current total over the other allowed cells.
+            others = ~self.excluded & ~restore
+            prior_others = self.prior[others].sum()
+            scale = self.grid[others].sum() / prior_others if prior_others > 0 else 1.0
+            self.grid[restore] = self.prior[restore] * scale
+        self._normalize()
+
+    def include_all_zones(self):
+        """Return to the original plan: every excluded zone is re-included."""
+        for name in list(self._zone_masks):
+            self.include_zone(name)
+
+    def excluded_zones(self):
+        return sorted(self._zone_masks)
+
+    def apply_guidance(self, command, zone=None, rect=None, sighting=None,
+                       sighting_sigma=2.5, sighting_weight=0.5):
+        """Update the map for one ACCEPTED operator command (operator_guidance.Cmd name):
+            INVESTIGATE  -> raise probability around the sighting point
+            AVOID        -> exclude the zone's rect
+            REINCLUDE    -> re-include the zone
+            RETURN_PLAN  -> re-include every zone
+            SEARCH_FIRST -> no change (it only reorders the plan)
+        """
+        if command == "INVESTIGATE" and sighting is not None:
+            self.add_sighting(sighting, sigma=sighting_sigma, weight=sighting_weight)
+        elif command == "AVOID" and zone is not None and rect is not None:
+            self.exclude_zone(zone, rect)
+        elif command == "REINCLUDE" and zone is not None:
+            self.include_zone(zone)
+        elif command == "RETURN_PLAN":
+            self.include_all_zones()
 
     def mark_searched(self, xy, radius):
         """Area already searched by another source (e.g., a ground team)."""
