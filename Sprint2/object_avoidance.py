@@ -58,6 +58,8 @@ CELL = 0.25                    # Map resolution (m).
 SAFETY_RADIUS = 0.50
 VERT_CLEAR = 0.75              # Vertical clearance band around the flight altitude (m).
 Z_BUCKET = 0.25
+GOAL_PROBE_CELLS = 2000        # PBI-04 AC-03: max cells the "is the goal walled in?" check explores
+
 
 # Reacting to blocked route.
 CLIMB_STEP = 1.0               # Metres gained per climb attempt.
@@ -170,6 +172,32 @@ class ObstacleMap:
                 grid[ix * n + iy] = 1
         return grid
 
+    def _goal_enclosed(self, grid, gi, si, limit=GOAL_PROBE_CELLS):
+        """
+        Quick unreachable check (PBI-04 AC-03): flood outward from the goal cell, up to `limit`
+        cells. Returns True if that region closes off without reaching the start, meaning the goal is
+        walled in, so A* doesn't have to search the whole map from the start side to find that out.
+        4-connected is enough: A*'s diagonal moves can't cut corners, so they reach the same cells.
+        """
+        n = self.n
+        seen, stack = {gi}, [gi]
+        while stack:
+            cx, cy = divmod(stack.pop(), n)
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                x2, y2 = cx + dx, cy + dy
+                if not (0 <= x2 < n and 0 <= y2 < n):
+                    continue
+                nb = x2 * n + y2
+                if nb == si:
+                    return False                 # reached the drone: not enclosed
+                if nb in seen or grid[nb]:
+                    continue
+                if len(seen) >= limit:
+                    return False                 # open area: let A* do the real search
+                seen.add(nb)
+                stack.append(nb)
+        return True
+
     def astar(self, start_xy, goal_xy, alt):
         """
         Shortest obstacle-free path on the grid at altitude `alt`.
@@ -192,6 +220,8 @@ class ObstacleMap:
         if self._dead is not None and self._dead[0] == key and gi not in self._dead[1]:
             return None
         grid = self._blocked_grid(alt)
+        if self._goal_enclosed(grid, gi, si):
+            return None
         gx, gy = g
         d = 1.4142
         # 8-connected grid: (dx, dy, cost, index step). Straight moves cost 1, diagonals sqrt(2).
