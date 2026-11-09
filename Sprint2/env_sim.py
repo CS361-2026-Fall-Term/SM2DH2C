@@ -1,11 +1,13 @@
 """
-Contributors: Mari Tokuda and Heeseo Kim
+Contributors: Mari Tokuda, Heeseo Kim and Mylan Bui
 File Description: Creates shared PyBullet environment. Builds the physical world where
 the search happens, including the visualization of the drone body, trees, and ground.
 While the target position is set here, the humaniod target is created and spawned 
 separately in target_detection.py.
 """
+import math
 import os
+import random
 import pybullet as p
 import pybullet_data
 import osm_world
@@ -31,6 +33,12 @@ FLIGHT_PATH = [
 
 # Set by use_osm(); None means the original hand-placed world.
 OSM_SCENE = None
+
+# Tall walls added by generate_layout() (PBI-04): (x, y, half_x, half_y, height). Empty = none.
+# build_world() turns each into a solid box the drone senses and must route around.
+WALLS = []
+WALL_HEIGHT = 7.0              # taller than the drone can climb (MAX_ALT 5.5 m + clearance)
+WALL_THICKNESS = 0.3
 
 # Detailed visuals (textured buildings, tree models, coloured ground, sky, shadows). main.py turns
 # this off with --simple-visuals. Visual only: collision shapes are identical either way.
@@ -93,6 +101,61 @@ def use_osm(lat, lon, area_m=None, osm_file=None, keep_clear=(), seed=0):
     return OSM_SCENE
 
 
+
+
+def generate_layout(seed, count, keep_clear=(), enclose=None, margin=1.5, min_spacing=1.2,
+                    pen_half=1.5):
+    """
+    PBI-04: replace the hand-placed trees with a seeded random layout of `count` obstacles.
+    The same seed always gives the same layout (AC-04).
+    Call ONCE, after scale_layout() and BEFORE build_world() (same as use_osm()).
+
+    keep_clear: (x, y) points (e.g. FLIGHT_PATH waypoints) that no tree may be within `margin` m of;
+                the drone start is always kept clear.
+    enclose:    optional (x, y) point to wall in with a 4-wall pen of WALL_HEIGHT, so that
+                destination is truly unreachable (AC-02). The 4 walls count toward `count`.
+    min_spacing: minimum distance between tree trunks (m), so trees don't merge into one blob.
+
+    OBSTACLE_POSITIONS, TREE_KINDS and WALLS are updated IN PLACE, so modules that imported
+    them see the new world. Returns a short summary dict.
+    """
+    rng = random.Random(seed)
+    half = sim_config.MAP_HALF - 1.0
+    clear = [tuple(DRONE_START_POS[:2])] + [tuple(c[:2]) for c in keep_clear]
+
+    WALLS.clear()
+    if enclose is not None:
+        ex, ey = enclose[0], enclose[1]
+        t = WALL_THICKNESS / 2
+        WALLS.extend([
+            (ex, ey + pen_half, pen_half + t, t, WALL_HEIGHT),     # north
+            (ex, ey - pen_half, pen_half + t, t, WALL_HEIGHT),     # south
+            (ex + pen_half, ey, t, pen_half + t, WALL_HEIGHT),     # east
+            (ex - pen_half, ey, t, pen_half + t, WALL_HEIGHT),     # west
+        ])
+
+    n_trees = max(0, count - len(WALLS))
+    trees, tries = [], 0
+    while len(trees) < n_trees and tries < 20000:
+        tries += 1
+        x, y = round(rng.uniform(-half, half), 2), round(rng.uniform(-half, half), 2)
+        if any(math.hypot(x - cx, y - cy) < margin for cx, cy in clear):
+            continue
+        if enclose is not None and (abs(x - enclose[0]) < pen_half + margin
+                                    and abs(y - enclose[1]) < pen_half + margin):
+            continue                                   # keep trees out of / off the pen walls
+        if any(math.hypot(x - tx, y - ty) < min_spacing for tx, ty, _ in trees):
+            continue
+        trees.append([x, y, 0.5])
+    if len(trees) < n_trees:
+        raise ValueError(f"could only place {len(trees)} of {n_trees} trees (seed {seed}); "
+                         f"lower count or margin")
+
+    OBSTACLE_POSITIONS[:] = trees
+    TREE_KINDS[:] = [rng.choice(("deciduous", "conifer")) for _ in trees]
+    return {"seed": seed, "trees": len(trees), "walls": len(WALLS)}
+
+
 def build_world(gui=True, assets=None):
     """
     Create exactly one world, drone and set of trees; target spawned separately.
@@ -141,6 +204,15 @@ def build_world(gui=True, assets=None):
         obstacle_ids.append(p.createMultiBody(0, tc, tv, [x, y, z]))
         canopy_orn = p.getQuaternionFromEuler([0, 0, (k * 2.399) % (2 * 3.14159)])   # vary each tree
         obstacle_ids.append(p.createMultiBody(0, lc, lv, [x, y, z + 1.75], canopy_orn))
+
+
+    # Tall walls from generate_layout() (PBI-04): solid boxes the drone can't climb over.
+    for x, y, hx, hy, h in WALLS:
+        wc = p.createCollisionShape(p.GEOM_BOX, halfExtents=[hx, hy, h / 2])
+        wv = p.createVisualShape(p.GEOM_BOX, halfExtents=[hx, hy, h / 2], rgbaColor=[0.6, 0.6, 0.62, 1])
+        obstacle_ids.append(p.createMultiBody(0, wc, wv, [x, y, h / 2]))
+
+
 
     # OSM buildings (solid, sensed by the drone's ray scan) plus roads/water/ground (visual only).
     if OSM_SCENE is not None:

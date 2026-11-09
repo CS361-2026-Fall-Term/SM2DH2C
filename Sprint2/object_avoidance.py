@@ -50,10 +50,16 @@ LOOKAHEAD = 4.0                # How far along the route we check for blockage.
 
 # Obstacle map.
 CELL = 0.25                    # Map resolution (m).
-# Map extent comes from sim_config.MAP_HALF (set by main.py); read when an ObstacleMap is built.
-SAFETY_RADIUS = 0.70           # Drone half-size + margin, inflation around hits (m).
+# Inflation around every sensed hit (m). PBI-04: lowered from 0.70 to 0.50 for generated
+# environments (AC-01). The drone's collision body is ~0.12 m in radius (0.08 m x DRONE_SCALE 1.5).
+# At 0.45 one seeded run passed 0.29 m from a canopy, just under the 0.3 m target, so 0.50 adds a
+# little margin. Gaps narrower than ~1 m may now count as blocked, but trees top out at 3.0 m, so
+# the drone climbs over them instead.
+SAFETY_RADIUS = 0.50
 VERT_CLEAR = 0.75              # Vertical clearance band around the flight altitude (m).
 Z_BUCKET = 0.25
+GOAL_PROBE_CELLS = 2000        # PBI-04 AC-03: max cells the "is the goal walled in?" check explores
+
 
 # Reacting to blocked route.
 CLIMB_STEP = 1.0               # Metres gained per climb attempt.
@@ -88,6 +94,8 @@ class ObstacleMap:
                      if math.hypot(dx, dy) * CELL <= SAFETY_RADIUS]
         self.seen = set()                     # raw (cell, bucket) already inflated
         self.new_hits = []                    # world points, for debug drawing
+        self._dead = None                     # (start, alt, map version), region a failed A* explored
+
 
     # --- coordinate helpers
     def to_cell(self, x, y):
@@ -154,6 +162,42 @@ class ObstacleMap:
         return self.to_xy(best) if best else None
 
     # --- A*
+    def _blocked_grid(self, alt):
+        """Flat bytearray over every cell (index ix * n + iy): 1 = blocked at this altitude.
+        Built once per A* call so the search does plain array lookups (PBI-04 AC-03)."""
+        n, buckets = self.n, self._buckets(alt)
+        grid = bytearray(n * n)
+        for (ix, iy), s in self.block.items():
+            if 0 <= ix < n and 0 <= iy < n and any(b in s for b in buckets):
+                grid[ix * n + iy] = 1
+        return grid
+
+    def _goal_enclosed(self, grid, gi, si, limit=GOAL_PROBE_CELLS):
+        """
+        Quick unreachable check (PBI-04 AC-03): flood outward from the goal cell, up to `limit`
+        cells. Returns True if that region closes off without reaching the start, meaning the goal is
+        walled in, so A* doesn't have to search the whole map from the start side to find that out.
+        4-connected is enough: A*'s diagonal moves can't cut corners, so they reach the same cells.
+        """
+        n = self.n
+        seen, stack = {gi}, [gi]
+        while stack:
+            cx, cy = divmod(stack.pop(), n)
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                x2, y2 = cx + dx, cy + dy
+                if not (0 <= x2 < n and 0 <= y2 < n):
+                    continue
+                nb = x2 * n + y2
+                if nb == si:
+                    return False                 # reached the drone: not enclosed
+                if nb in seen or grid[nb]:
+                    continue
+                if len(seen) >= limit:
+                    return False                 # open area: let A* do the real search
+                seen.add(nb)
+                stack.append(nb)
+        return True
+
     def astar(self, start_xy, goal_xy, alt):
         """
         Shortest obstacle-free path on the grid at altitude `alt`.
@@ -168,42 +212,57 @@ class ObstacleMap:
         s, g = self.to_cell(*start_xy), self.to_cell(*goal_xy)
         if not self.in_bounds(s) or not self.in_bounds(g) or self.blocked_cell(g, alt):
             return None
-        # 8-connected grid: straight moves cost 1, diagonal moves cost sqrt(2).        
-        moves = [(1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
-                 (1, 1, 1.4142), (1, -1, 1.4142), (-1, 1, 1.4142), (-1, -1, 1.4142)]
+        n = self.n
+        si, gi = s[0] * n + s[1], g[0] * n + g[1]
+        # A failed search already explored everything reachable from this start. If nothing new
+        # has been sensed since, a goal outside that region is unreachable too: skip the search.
+        key = (si, round(alt, 3), len(self.seen))
+        if self._dead is not None and self._dead[0] == key and gi not in self._dead[1]:
+            return None
+        grid = self._blocked_grid(alt)
+        if self._goal_enclosed(grid, gi, si):
+            return None
+        gx, gy = g
+        d = 1.4142
+        # 8-connected grid: (dx, dy, cost, index step). Straight moves cost 1, diagonals sqrt(2).
+        moves = [(1, 0, 1.0, n), (-1, 0, 1.0, -n), (0, 1, 1.0, 1), (0, -1, 1.0, -1),
+                 (1, 1, d, n + 1), (1, -1, d, n - 1), (-1, 1, d, -n + 1), (-1, -1, d, -n - 1)]
 
         # Heuristic: octile distance, the exact cost to the goal if nothing were in the way.
         # It never overestimates, so A* still returns the shortest path.
-        def h(c):
-            dx, dy = abs(c[0] - g[0]), abs(c[1] - g[1])
-            return (dx + dy) + (1.4142 - 2) * min(dx, dy)
+        def h(i):
+            dx, dy = abs(i // n - gx), abs(i % n - gy)
+            return (dx + dy) + (d - 2) * min(dx, dy)
 
-        # openq: priority queue of (estimated total cost, cost so far, cell), cheapest first.
+        # openq: priority queue of (estimated total cost, cost so far, cell index), cheapest first.
         # came:  cell -> the cell we reached it from, used to rebuild the path.
         # gscore: cell -> cheapest known cost from the start.
-        openq = [(h(s), 0.0, s)]
-        came, gscore = {}, {s: 0.0}
+        openq = [(h(si), 0.0, si)]
+        came, gscore = {}, {si: 0.0}
         while openq:
             _, gc, cur = heapq.heappop(openq)
-            # Reached the goal: walk the `came` links backwards to get the path, then smooth it.            
-            if cur == g:
+            # Reached the goal: walk the `came` links backwards to get the path, then smooth it.
+            if cur == gi:
                 path = [cur]
                 while cur in came:
                     cur = came[cur]
                     path.append(cur)
                 path.reverse()
-                return self._smooth([self.to_xy(c) for c in path], alt, start_xy, goal_xy)
-            # Skip stale queue entries; a cheaper route to this cell was already found.            
+                return self._smooth([self.to_xy((i // n, i % n)) for i in path], alt, start_xy, goal_xy)
+            # Skip stale queue entries; a cheaper route to this cell was already found.
             if gc > gscore.get(cur, 1e9):
                 continue
-            # Try each neighbor that isn't blocked at this altitude.            
-            for dx, dy, cost in moves:
-                nb = (cur[0] + dx, cur[1] + dy)
-                if self.blocked_cell(nb, alt):
+            cx, cy = divmod(cur, n)
+            # Try each neighbor that is on the map and not blocked at this altitude.
+            for dx, dy, cost, step in moves:
+                x2, y2 = cx + dx, cy + dy
+                if not (0 <= x2 < n and 0 <= y2 < n):
                     continue
-                # Don't move diagonally past the corner of an obstacle.                
-                if dx and dy and (self.blocked_cell((cur[0] + dx, cur[1]), alt) or
-                                  self.blocked_cell((cur[0], cur[1] + dy), alt)):
+                nb = cur + step
+                if grid[nb]:
+                    continue
+                # Don't move diagonally past the corner of an obstacle.
+                if dx and dy and (grid[cur + dx * n] or grid[cur + dy]):
                     continue  # no corner cutting
                 # Record the neighbor if this is the cheapest way found to reach it so far.
                 ng = gc + cost
@@ -212,7 +271,9 @@ class ObstacleMap:
                     came[nb] = cur
                     heapq.heappush(openq, (ng + h(nb), ng, nb))
         # Queue ran out without reaching the goal: no path exists at this altitude.
+        self._dead = (key, set(gscore))
         return None
+
 
     def _smooth(self, pts, alt, start_xy, goal_xy):
         """
@@ -254,6 +315,9 @@ class Navigator:
         self.t = 0.0
         self.events = []
         self.replans = 0
+        self.replan_ms = []          # wall time of every replan() call, in ms (PBI-04 AC-03)
+        self.skipped = []            # (sim time, waypoint index) of every unreachable waypoint skipped
+
         self.emergency_stops = 0
         self.last_replan_t = -99.0
         self.target_seen = False
@@ -339,8 +403,16 @@ class Navigator:
             cur = (x, y)
         return False
 
-    # ----------------------------------------------------------- RESPOND --
     def replan(self):
+        """Timed wrapper around _replan() (PBI-04 AC-03): records how long each replan takes."""
+        t0 = time.perf_counter()
+        ok = self._replan()
+        self.replan_ms.append((time.perf_counter() - t0) * 1000.0)
+        return ok
+
+
+    # ----------------------------------------------------------- RESPOND --
+    def _replan(self):
         """
         Plan a detour to the first reachable remaining waypoint at the current altitude.
         Tries the remaining waypoints in order and uses A* to find an obstacle-free path to each.
@@ -369,8 +441,14 @@ class Navigator:
             if snapped != goal:
                 self.event("REPLAN", f"waypoint {j} sits inside an obstacle margin; moved to "
                                      f"({snapped[0]:.1f}, {snapped[1]:.1f})")
-            if j >= 0 and j != self.wp_next:
-                self.event("REPLAN", f"waypoint(s) {self.wp_next}..{j - 1} unreachable, skipped")
+                        # Waypoints still in the route before j had no path: name each one (PBI-04 AC-02).
+            if j >= 0:
+                for s in remaining[:remaining.index(j)]:
+                    sx, sy = self.wps[s]
+                    self.skipped.append((self.t, s))
+                    self.event("UNREACH", f"waypoint {s} at ({sx:.1f}, {sy:.1f}) is unreachable at "
+                                          f"alt {self.alt:.1f} m - skipped; heading to waypoint {j}")
+
             # Build the new route: A* detour points (index None), then the reached waypoint
             # tagged with its index, then every later waypoint unchanged.            
             route = [(x, y, None) for (x, y) in path[:-1]]
@@ -410,6 +488,13 @@ class Navigator:
             self.state = "CLIMB"
             self.event("CLIMB", f"no horizontal detour; climbing to {self.alt:.1f} m to look over the obstacle")
             return
+        # Every remaining waypoint is unreachable even at the maximum altitude: name each one (AC-02).
+        for s in [r[2] for r in self.route if r[2] is not None]:
+            sx, sy = self.wps[s]
+            self.skipped.append((self.t, s))
+            self.event("UNREACH", f"waypoint {s} at ({sx:.1f}, {sy:.1f}) is unreachable even at "
+                                  f"{self.alt:.1f} m - skipped; returning to launch")
+        
         self.event("RTL", "no route at maximum altitude; returning to launch")
         self.alt = max(self.alt, self.cruise)
         self.state = "RTL"
