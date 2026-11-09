@@ -2,7 +2,8 @@
 File Description: Operator mission-setup window (issue #55).
 
 Shown BEFORE the PyBullet simulation starts, so the operator enters the initial information
-(last known position, size of the search area, map data source, display options) in a window
+(last known position, size of the search area, missing person, zones to exclude, map data
+source, display options) in a window
 instead of on the command line. The window:
   - validates every input and shows a message next to each one (green = accepted, red = error),
   - loads the map data for the last known position (download or exported file) and reports
@@ -23,6 +24,13 @@ import tempfile
 import threading
 
 import sim_config
+from operator_guidance import ZONES
+
+try:                                            # PBI-03: categories come from the probability map code
+    from terrain_prior import PERSON_CATEGORIES, DEFAULT_CATEGORY
+    CATEGORIES = list(PERSON_CATEGORIES)
+except ImportError:                             # numpy missing: still show the window
+    CATEGORIES, DEFAULT_CATEGORY = ["hiker", "runner", "child", "elderly/dementia"], "hiker"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LAST_SETUP = os.path.join(HERE, "last_setup.json")     # pre-fills the window next time
@@ -44,12 +52,27 @@ DEFAULTS = {
     "visuals": "detailed",      # "detailed" | "simple"
     "camera": "locked",         # "locked" | "follow" | "free"  (see main.CAMERA_MODES)
     "max_time": "",             # blank = automatic
+    "person_category": DEFAULT_CATEGORY,   # PBI-03: selects the distance-ring table
+    "exclude_zones": "",        # PBI-03: zone letters to exclude before the mission, e.g. "AC"
 }
 
 MIN_TIME, MAX_TIME = 10.0, 3600.0
 
 
 # ======================================================================= validation (no GUI)
+def parse_zones(text):
+    """'A, c' / 'AC' / ['A', 'C'] -> ['A', 'C'] (sorted, no repeats). Raises ValueError for an
+    unknown zone letter."""
+    letters = text if isinstance(text, (list, tuple)) else str(text or "").replace(",", " ").split()
+    if not isinstance(text, (list, tuple)) and len(letters) == 1 and len(letters[0]) > 1:
+        letters = list(letters[0])              # "AC" -> ["A", "C"]
+    zones = sorted({str(z).strip().upper() for z in letters if str(z).strip()})
+    unknown = [z for z in zones if z not in ZONES]
+    if unknown:
+        raise ValueError(f"unknown zone {', '.join(unknown)} (zones are {', '.join(ZONES)})")
+    return zones
+
+
 def _number(text, kind=float):
     text = str(text).strip()
     if text == "":
@@ -153,6 +176,29 @@ def validate_inputs(raw):
     except ValueError:
         msg["max_time"] = (False, "Time limit must be a number of seconds, or blank for automatic.")
 
+    # --- missing person (PBI-03)
+    category = str(raw.get("person_category") or DEFAULT_CATEGORY).strip()
+    if category in CATEGORIES:
+        cfg["person_category"] = category
+        msg["person_category"] = (True, f"Person category: {category}.")
+    else:
+        msg["person_category"] = (False, f"Choose a person category ({', '.join(CATEGORIES)}).")
+
+    # --- zones excluded before the mission (PBI-03); same rule as "Do not search": the search
+    # needs at least one zone left
+    try:
+        zones = parse_zones(raw.get("exclude_zones", ""))
+        if len(zones) >= len(ZONES):
+            msg["exclude_zones"] = (False, "At least one zone must stay in the search.")
+        else:
+            cfg["exclude_zones"] = zones
+            if zones:
+                msg["exclude_zones"] = (True, f"Zone{'s' if len(zones) > 1 else ''} "
+                                              f"{', '.join(zones)} will not be searched.")
+    except ValueError as exc:
+        text = str(exc)
+        msg["exclude_zones"] = (False, text[:1].upper() + text[1:] + ".")
+
     cfg["simple_visuals"] = raw.get("visuals") == "simple"
     cam = raw.get("camera") or "locked"
     if cam not in ("locked", "follow", "free"):
@@ -240,6 +286,9 @@ def describe(cfg, counts=None):
         if counts is not None:
             found = ", ".join(f"{n} {k}" for k, n in counts.items() if n)
             text += f" Map data loaded: {found or 'no mapped features (open ground)'}."
+    text += f" Missing person: {cfg.get('person_category', DEFAULT_CATEGORY)}."
+    if cfg.get("exclude_zones"):
+        text += f" Excluded zones: {', '.join(cfg['exclude_zones'])}."
     return text
 
 
@@ -369,6 +418,31 @@ def run_dialog(defaults=None):
     fb.pack(side="left", padx=(6, 0))
     widgets_osm += [fe, fb]
     msg_label(r, "osm_file")
+    r += 1
+
+    section(r, "Missing person and zones"); r += 2
+    ttk.Label(frm, text="Person category").grid(row=r, column=0, sticky="w")
+    ttk.Combobox(frm, textvariable=var["person_category"], values=CATEGORIES, state="readonly",
+                 width=18).grid(row=r, column=1, sticky="w", pady=2)
+    ttk.Label(frm, text="sets how far they may have travelled", style="Sub.TLabel").grid(
+        row=r, column=2, sticky="w")
+    msg_label(r, "person_category")
+    r += 1
+    ttk.Label(frm, text="Do not search").grid(row=r, column=0, sticky="w")
+    zone_row = ttk.Frame(frm)
+    zone_row.grid(row=r, column=1, columnspan=2, sticky="w")
+    try:
+        already = set(parse_zones(var["exclude_zones"].get()))
+    except ValueError:
+        already = set()
+    zone_vars = {z: tk.BooleanVar(value=z in already) for z in ZONES}
+
+    def zones_changed(*_):
+        var["exclude_zones"].set("".join(z for z, v in zone_vars.items() if v.get()))
+    for z, v in zone_vars.items():
+        ttk.Checkbutton(zone_row, text=f"Zone {z}", variable=v, command=zones_changed).pack(
+            side="left", padx=(0, 8))
+    msg_label(r, "exclude_zones")
     r += 1
 
     section(r, "Display and advanced options"); r += 2
@@ -563,7 +637,9 @@ def cfg_to_raw(cfg):
             "osm_file": cfg.get("osm_file") or "", "map_size": blank(cfg["map_size"]),
             "seed": str(cfg["seed"]), "visuals": "simple" if cfg["simple_visuals"] else "detailed",
             "camera": cfg.get("camera") or ("free" if cfg.get("free_camera") else "locked"),
-            "max_time": blank(cfg["max_time"])}
+            "max_time": blank(cfg["max_time"]),
+            "person_category": cfg.get("person_category", DEFAULT_CATEGORY),
+            "exclude_zones": "".join(cfg.get("exclude_zones", []))}
 
 
 class SetupUnavailable(RuntimeError):

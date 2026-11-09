@@ -10,6 +10,7 @@ Run: python main.py                  (mission setup window, then GUI; press STAR
                                                (300 real m of OSM squeezed into a 60 m map)
      python main.py --camera follow            (camera: locked | follow | free - see CAMERA_MODES)
      python main.py --simple-visuals           (flat colours, no textures/tree models/shadows: faster)
+     python main.py --person child --exclude-zones AC   (PBI-03: missing person category, zones not searched)
 
 Search-area size:
   --area      how much ground the search covers, in real metres (MIN_AREA_M..MAX_AREA_M in sim_config).
@@ -26,6 +27,7 @@ import operator_panel
 import operator_setup
 import osm_world
 import sim_config
+import terrain_prior
 from env_sim import build_world, FLIGHT_PATH, DRONE_START_POS, OBSTACLE_POSITIONS
 from object_avoidance import Navigator, DT
 from target_detection import MissingPerson, SearchMonitor
@@ -124,6 +126,13 @@ ZONE_COLOURS = {"next": [0.1, 0.85, 0.1], "planned": [0.3, 0.7, 1.0], "searched"
                 "excluded": [0.95, 0.2, 0.2]}
 
 
+def zone_rect(xy, half):
+    """(x0, y0, x1, y1) of the square drawn for a zone (draw_zone_markers). The probability map
+    excludes exactly this square, so what the operator sees outlined is what is excluded."""
+    h = zone_box_half(xy, half)
+    return (xy[0] - h, xy[1] - h, xy[0] + h, xy[1] + h)
+
+
 def apply_operator_command(mission, cmd, zone, nav, belief, reroute=None):
     """
     Validate and apply one live operator command (PBI-09), then make the drone follow it.
@@ -135,8 +144,16 @@ def apply_operator_command(mission, cmd, zone, nav, belief, reroute=None):
     reroute = reroute or set_destination
     res = mission.handle(cmd, zone)
     if res.ok:
-        if res.sighting is not None and belief is not None:
-            belief.add_sighting(res.sighting, sigma=max(2.5, 0.15 * sim_config.MAP_HALF), weight=0.5)
+        if belief is not None:
+            sigma = max(2.5, 0.15 * sim_config.MAP_HALF)
+            if hasattr(belief, "apply_guidance"):
+                # PBI-03: sightings raise the map, Do not search / Re-include / Return to plan
+                # exclude and restore the zone's cells.
+                rect = zone_rect(ZONES[res.zone], sim_config.MAP_HALF) if res.zone in ZONES else None
+                belief.apply_guidance(res.command, res.zone, rect, res.sighting,
+                                      sighting_sigma=sigma, sighting_weight=0.5)
+            elif res.sighting is not None:
+                belief.add_sighting(res.sighting, sigma=sigma, weight=0.5)
         if res.reroute:
             if mission.destination:
                 reroute(nav, mission.destination)
@@ -202,6 +219,35 @@ def set_destination(nav, xy):
     nav.draw_route()
 
 
+def start_mission(mission, nav, belief, exclude_zones=(), reroute=None):
+    """Start the mission, then apply the zones the operator excluded in the setup window (PBI-03).
+    They go through Mission.handle like a live "Do not search", so the plan, the zone colours and the
+    probability map stay in sync and the same safety rules apply. Returns the start message."""
+    reroute = reroute or set_destination
+    first_start = mission.state == "IDLE"
+    msg = mission.start()
+    if not first_start:
+        return msg
+    if mission.destination:
+        reroute(nav, mission.destination)
+    for z in exclude_zones:
+        res = apply_operator_command(mission, Cmd.AVOID, z, nav, belief, reroute)
+        print(f"[setup] {res.message}")
+    return msg
+
+
+def build_initial_belief(belief, scene, category):
+    """PBI-03: load the starting map (distance from the LKP x terrain) into the probability map.
+    The LKP is the map centre (0, 0). Returns a warning for the operator, or None."""
+    t0 = time.perf_counter()
+    initial, warning = terrain_prior.build_initial_map(scene, belief, (0.0, 0.0), category,
+                                                       sim_config.MAP_HALF)
+    belief.set_initial(initial)
+    print(f"Initial probability map: {category}, {belief.nx} x {belief.ny} cells, "
+          f"built in {(time.perf_counter() - t0) * 1000:.1f} ms" + (f" ({warning})" if warning else ""))
+    return warning
+
+
 def _free_camera_keys(dt):
     """Free camera: arrow keys pan sideways / forward relative to where the camera looks,
     PageUp / PageDown move it up / down. (Mouse panning is Ctrl/Alt + middle-drag, which
@@ -247,6 +293,10 @@ def _setup_prefill(args):
         pre["visuals"] = "simple"
     if args.camera or args.free_camera:
         pre["camera"] = args.camera or "free"
+    if args.person:
+        pre["person_category"] = args.person
+    if args.exclude_zones:
+        pre["exclude_zones"] = args.exclude_zones
     return pre
 
 
@@ -279,6 +329,11 @@ def main():
                         help="don't dock the operator panel beside the 3D window")
     parser.add_argument("--no-ui", action="store_true",
                         help="skip the mission setup window and use the command-line options")
+    parser.add_argument("--person", choices=list(terrain_prior.PERSON_CATEGORIES), default=None,
+                        help="missing person category; sets the distance rings of the initial "
+                             f"probability map (default {terrain_prior.DEFAULT_CATEGORY})")
+    parser.add_argument("--exclude-zones", default=None,
+                        help="zones not to search, set before the mission, e.g. AC")
     args = parser.parse_args()
 
     # ---- Mission setup window (issue #55): the operator enters the initial information here,
@@ -299,12 +354,21 @@ def main():
             args.simple_visuals = cfg["simple_visuals"]
             args.camera = cfg.get("camera") or ("free" if cfg.get("free_camera") else "locked")
             args.max_time = cfg["max_time"]
+            args.person = cfg.get("person_category") or args.person
+            args.exclude_zones = cfg.get("exclude_zones") or args.exclude_zones
             setup_summary = cfg.get("summary", "")
             print("Mission setup accepted:", setup_summary)
     if (args.lat is None) != (args.lon is None):
         parser.error("--lat and --lon must be given together")
     if args.osm_file and args.lat is None:
         parser.error("--osm-file needs --lat and --lon (the last known position)")
+    person_category = args.person or terrain_prior.DEFAULT_CATEGORY
+    try:
+        exclude_zones = operator_setup.parse_zones(args.exclude_zones or "")
+    except ValueError as exc:
+        parser.error(f"--exclude-zones: {exc}")
+    if len(exclude_zones) >= len(ZONES):
+        parser.error("--exclude-zones: at least one zone must stay in the search")
 
     # ---- Search-area size: validate, then size everything BEFORE any world object is built.
     area = sim_config.BASE_MAP_SIZE if args.area is None else args.area
@@ -330,6 +394,7 @@ def main():
         print(f"Map {map_size:g} m x {map_size:g} m (hand-placed layout x{k:.2f}); zones {ZONES}")
 
     env_sim.DETAILED_VISUALS = not args.simple_visuals
+    scene = None                                        # OSM scene (None = practice world)
     if args.lat is not None:
         try:
             scene = env_sim.use_osm(args.lat, args.lon, area, args.osm_file,
@@ -362,6 +427,11 @@ def main():
     # 60 m map (3600 bodies) would make startup and the GUI slow.
     cell = max(1.0, max(x_range[1] - x_range[0], y_range[1] - y_range[0]) / 30.0)
     belief = ProbabilityMap(x_range=x_range, y_range=y_range, cell_size=cell, pod=0.65)
+    # PBI-03: start from the LKP + terrain map instead of a uniform one, with the zones excluded
+    # in the setup window already shown in red before START.
+    map_warning = build_initial_belief(belief, scene, person_category)
+    for z in exclude_zones:
+        belief.exclude_zone(z, zone_rect(ZONES[z], sim_config.MAP_HALF))
     if gui:
         # Build all heatmap tiles once, up front, with rendering off so there is no
         # mid-mission freeze when the first tiles are created.
@@ -372,6 +442,8 @@ def main():
     mission = Mission()
     if setup_summary is not None:
         mission.response = "Setup accepted - environment generated. Press START MISSION"
+    if map_warning:
+        mission.response = f"Warning: {map_warning}. Press START MISSION"
     # Two-point route is replaced when the mission starts.
     nav = Navigator(drone_id, floor_id, person.body_id,
                     [DRONE_START_POS, [DRONE_START_POS[0], DRONE_START_POS[1], 2.5]], gui, print)
@@ -417,8 +489,7 @@ def main():
         p.resetDebugVisualizerCamera(cameraDistance=FOLLOW_VIEW[0], cameraYaw=FOLLOW_VIEW[1],
                                      cameraPitch=FOLLOW_VIEW[2], cameraTargetPosition=cam_pos)
     else:
-        mission.start()
-        set_destination(nav, mission.destination)
+        start_mission(mission, nav, belief, exclude_zones)
 
     next_tick = time.perf_counter()      # deadline for the next render tick (GUI pacing)
     tick_t0 = next_tick                  # start of the current tick, for the profiler
@@ -436,11 +507,7 @@ def main():
                     for ev in events:
                         kind = ev[0]
                         if kind == "start":
-                            if mission.state == "IDLE":
-                                mission.start()
-                                set_destination(nav, mission.destination)
-                            else:
-                                mission.start()
+                            start_mission(mission, nav, belief, exclude_zones)
                             force_hud = True
                         elif kind == "heat":
                             belief.set_heatmap_visible(not belief.heatmap_visible)
