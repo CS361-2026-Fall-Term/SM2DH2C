@@ -14,6 +14,8 @@ Run: python main.py                  (mission setup window, then GUI; press STAR
      python main.py --headless --person -9 -9  (place the person at x=-9, y=-9 sim metres)
      python main.py --person-seed 42           (repeat a random person location; default: new random spot each run)
      python main.py --person child -9 -9       (category and position together)
+     python main.py --resume                   (PBI-10: continue the last saved mission after a crash;
+                                                see mission_state.py / MISSION_STATE.md)
 
 After the zone plan ends, the drone keeps searching the most likely cells of the probability map
 (map_search.py) until the person is found or the time limit is reached.
@@ -43,6 +45,8 @@ from target_detection import MissingPerson, SearchMonitor
 from operator_guidance import Mission, Cmd, ZONES, ZONE_COMMANDS, scale_zones
 from map_search import MapGuidedSearch, SightingConfirm
 from probability_map import ProbabilityMap
+from mission_state import (MissionStateStore, DEFAULT_PATH, setup_from_args,
+                           apply_setup_to_args, describe, restore_belief)
 
 # Mission logic (navigation, detection, probability map) still advances every DT (240 Hz).
 # Everything that talks to the PyBullet GUI (button reads, pose push, stepSimulation, camera,
@@ -446,16 +450,47 @@ def main():
                              "default); fixed = always A -> B -> C -> D")
     parser.add_argument("--exclude-zones", default=None,
                         help="zones not to search, set before the mission, e.g. AC")
+    parser.add_argument("--resume", action="store_true",
+                        help="continue the last saved mission (state, plan, history, drone position, "
+                             "probability map) instead of starting a new one")
+    parser.add_argument("--state-file", default=DEFAULT_PATH,
+                        help="where the mission state is saved (default: mission_state.json here)")
     args = parser.parse_args()
     try:
         args.person_category, person_xy = parse_person(args.person)
     except ValueError as exc:
         parser.error(f"--person: {exc}")
 
+    # ---- Saved mission state (PBI-10). With --resume the last saved state is loaded and the
+    # operator's starting information is reused, so the same world (and person spot) is rebuilt.
+    # Without it, any old state file is moved aside (mission_state.json.previous).
+    store = MissionStateStore(args.state_file)
+    resumed = None
+    if args.resume:
+        loaded = store.load()
+        for problem in loaded.problems:
+            print(f"[state] Skipped saved file - {problem}")
+        if loaded.payload is None:
+            print("[state] No usable saved mission found; starting a new mission.")
+        elif loaded.payload.get("setup") is None:
+            print("[state] The saved mission has no starting information; starting a new mission.")
+        else:
+            resumed = loaded.payload
+            apply_setup_to_args(args, resumed["setup"])
+            if resumed["setup"].get("person_xy") is not None:
+                person_xy = tuple(resumed["setup"]["person_xy"])
+            print(f"[state] Resuming saved mission ({loaded.source} file): {describe(resumed)}")
+    else:
+        old = store.load().payload
+        if old is not None and old["mission"]["state"] == "SEARCHING":
+            print("[state] An unfinished mission was saved earlier. Run with --resume to continue it; "
+                  "starting a new mission (the old file is kept as mission_state.json.previous).")
+        store.archive_previous()
+
     # ---- Mission setup window (issue #55): the operator enters the initial information here,
     # it is validated, and only then is the environment generated. Command-line values pre-fill it.
     setup_summary = None
-    if not args.headless and not args.no_ui:
+    if not args.headless and not args.no_ui and resumed is None:
         try:
             cfg = operator_setup.ask(_setup_prefill(args))
         except operator_setup.SetupUnavailable as exc:
@@ -485,6 +520,7 @@ def main():
         parser.error(f"--exclude-zones: {exc}")
     if len(exclude_zones) >= len(ZONES):
         parser.error("--exclude-zones: at least one zone must stay in the search")
+    args.exclude_zones = "".join(exclude_zones) or None     # saved in this form (PBI-10)
 
     # ---- Search-area size: validate, then size everything BEFORE any world object is built.
     area = sim_config.BASE_MAP_SIZE if args.area is None else args.area
@@ -574,6 +610,8 @@ def main():
         print(f"Person placed at {map_search.fmt(person_xy)}, {d:.1f} m from the nearest zone "
               f"centre (zone {z})")
     person = MissingPerson.spawn(person_xy)
+    # PBI-10: every save carries the starting information, so --resume rebuilds this same search.
+    store.set_context(setup=setup_from_args(args, person_xy), zones=ZONES)
     # label_dz lifts the detection label above the Navigator's label so they don't overprint.
     monitor = SearchMonitor(person, gui=gui, label_dz=1.4)
 
@@ -589,7 +627,7 @@ def main():
         p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
 
     mission = Mission()
-    if args.zone_order == "map":
+    if args.zone_order == "map" and resumed is None:   # a resumed mission keeps its saved order
         order, mass = zones_by_probability(belief)
         print("Zone order by probability: " + " -> ".join(f"{z} ({mass[z]:.0%})" for z in order))
         if scene is not None:
@@ -597,15 +635,46 @@ def main():
                 print("  " + line)
         mission.set_plan_order(order)
     if setup_summary is not None:
-        mission.response = "Setup accepted - environment generated. Press START MISSION"
-    if map_warning:
-        mission.response = f"Warning: {map_warning}. Press START MISSION"
+        mission.notify("SETUP", "Setup accepted - environment generated. Press START MISSION")
+    if map_warning and resumed is None:
+        mission.notify("MAP", f"Warning: {map_warning}. Press START MISSION")
     # Two-point route is replaced when the mission starts.
     nav = Navigator(drone_id, floor_id, person.body_id,
                     [DRONE_START_POS, [DRONE_START_POS[0], DRONE_START_POS[1], 2.5]], gui, print)
     nav.route = []
     nav.state = "IDLE"
     nav.alt = 2.5
+    if resumed is not None:
+        # PBI-10: put the mission back as it was saved and send the drone on its way again.
+        try:
+            note = mission.restore(resumed["mission"])
+        except ValueError as exc:                    # cannot happen after load(); belt and braces
+            print(f"[state] Saved mission could not be restored ({exc}); starting a new one.")
+        else:
+            if note:
+                print("[state] Note:", note)
+            # Probability map: the zones excluded at the moment of the crash (or, before START,
+            # in the setup window), then the saved cell values, so searched cells stay searched.
+            belief.include_all_zones()
+            for z in (mission.excluded if mission.state != "IDLE" else exclude_zones):
+                belief.exclude_zone(z, zone_rect(ZONES[z], sim_config.MAP_HALF))
+            if restore_belief(belief, resumed.get("belief")):
+                print("[state] Probability map restored")
+            drone = resumed.get("drone") or {}
+            pos = drone.get("pos")
+            half = sim_config.MAP_HALF
+            if pos and abs(pos[0]) <= half and abs(pos[1]) <= half and 0.0 <= pos[2] <= 20.0:
+                nav.pos[:] = pos                     # continue from where the drone was
+            if drone.get("t") is not None:
+                nav.t = min(float(drone["t"]), max_time)   # the time limit keeps counting
+            if mission.state == "SEARCHING":
+                if mission.destination:
+                    set_destination(nav, mission.destination)
+                else:                                # zone plan done: map-guided search resumes
+                    nav.route = []
+                    nav.state = "DONE"
+            print(f"[state] Resumed: {mission.state}, plan {mission.plan}, searched "
+                  f"{mission.visited}, excluded {mission.excluded}, sim time {nav.t:.1f} s")
     # Map-guided search (runs once the zone plan is finished). A viewpoint must be clear of
     # obstacles the drone has already sensed.
     def viewpoint_blocked(x, y):
@@ -655,8 +724,9 @@ def main():
         # Starting view: the locked chase view, centred on the drone.
         p.resetDebugVisualizerCamera(cameraDistance=FOLLOW_VIEW[0], cameraYaw=FOLLOW_VIEW[1],
                                      cameraPitch=FOLLOW_VIEW[2], cameraTargetPosition=cam_pos)
-    else:
+    elif mission.state == "IDLE":
         start_mission(mission, nav, belief, exclude_zones)
+    store.autosave(mission, nav.pos, force=True, belief=belief, sim_t=nav.t)   # first save
 
     next_tick = time.perf_counter()      # deadline for the next render tick (GUI pacing)
     tick_t0 = next_tick                  # start of the current tick, for the profiler
@@ -733,11 +803,9 @@ def main():
                     if mission.destination and searcher.active:
                         searcher.cancel()
                     if nav.state == "ABORT":
-                        mission.state = "ABORT"
-                        mission.response = "Navigation aborted: awaiting operator"
+                        mission.finish("ABORT", "NAV", "Navigation aborted: awaiting operator")
                     elif nav.state == "RTL_DONE":
-                        mission.state = "COMPLETE"
-                        mission.response = "Returned to launch"
+                        mission.finish("COMPLETE", "NAV", "Returned to launch")
                     elif nav.state == "DONE" and not mission.destination and not holding:
                         # Map-guided phase: the zone plan is finished, keep searching the most
                         # likely cells of the probability map. The mission stays SEARCHING.
@@ -890,12 +958,15 @@ def main():
                             cameraTargetPosition=cam_pos
                         )
 
+            # PBI-10: save right away when the mission changed (state, plan, zones, a new message),
+            # and refresh the drone position + probability map every 0.5 s while searching.
+            if render:
+                with prof.section("save"):
+                    store.autosave(mission, nav.pos, belief=belief, sim_t=nav.t)
+
             step_count += 1
             if not gui and mission.state in ("FOUND", "ABORT", "COMPLETE"):
                 break
-        # Time limit reached without a find: end the search and report where to look next.
-        if p.isConnected() and nav.t >= max_time and mission.state == "SEARCHING":
-            mission.time_up(searcher.most_likely())
             # Pace once per render tick, at the end of the group of logic steps, so the next
             # render step (pose push, camera) lands on a steady 60 Hz deadline.
             if gui and step_count % render_every == 0:
@@ -909,9 +980,17 @@ def main():
                     next_tick = time.perf_counter()   # fell behind; don't try to catch up
                 prof.end_tick()
                 tick_t0 = time.perf_counter()
+        # Time limit reached without a find: end the search and report where to look next.
+        if p.isConnected() and nav.t >= max_time and mission.state == "SEARCHING":
+            mission.time_up(searcher.most_likely())
     except KeyboardInterrupt:
         pass
     finally:
+        # Final save on a normal exit / Ctrl+C / error (a hard crash is covered by the autosaves).
+        store.autosave(mission, nav.pos, force=True, belief=belief, sim_t=nav.t)
+        if store.saves:
+            print(f"[state] Mission state saved to {store.path} ({store.saves} saves, slowest "
+                  f"{store.max_save_s * 1000:.1f} ms)")
         if panel is not None:
             panel.close()
         prof.report()

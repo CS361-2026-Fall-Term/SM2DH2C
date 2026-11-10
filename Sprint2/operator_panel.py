@@ -60,7 +60,6 @@ class OperatorPanel:
         self._hist_n = 0            # mission.history entries already copied into the log
         self._last_resp = None      # last mission.response seen (catches messages not in history)
         self._latest = None         # (text, kind) of the newest message
-        self._visited_n = 0         # zones already reported as searched
         self._resized = False       # sized again once the first refresh filled in the labels
         self.docker = None          # window_dock.Docker while docked to the 3D window (Windows)
 
@@ -358,16 +357,17 @@ class OperatorPanel:
         mission.response that main.py set directly (those don't go through history)."""
         import time as _time
         hist = mission.history
-        if self._hist_n > len(hist):                    # history was reset
+        # history_count = lines ever recorded (the list itself is capped, PBI-10), so new lines
+        # are still found once the cap is reached.
+        total = getattr(mission, "history_count", len(hist))
+        if self._hist_n > total:                        # history was reset (e.g. restored)
             self._hist_n = 0
-        for ts, source, msg in hist[self._hist_n:]:
+        new = min(total - self._hist_n, len(hist))
+        for ts, source, msg in (hist[-new:] if new > 0 else []):
             self._add_message(ts, str(source), msg)
         logged_last = hist[-1][2] if hist else None
-        self._hist_n = len(hist)
-        for z in mission.visited[self._visited_n:]:     # arrived() doesn't log, so report it here
-            nxt = f" - heading to Zone {mission.plan[0]}" if mission.plan else ""
-            self._add_message(_time.time(), "ARRIVED", f"Zone {z} searched{nxt}")
-        self._visited_n = len(mission.visited)
+        self._hist_n = total
+        # Zone arrivals are logged by Mission.arrived() (PBI-10), so they come in with history.
         resp = mission.response
         if resp and resp != self._last_resp and resp != logged_last:
             self._add_message(_time.time(), "MISSION", resp)

@@ -16,6 +16,7 @@ import math
 import os
 import re
 import subprocess
+import tempfile
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -48,7 +49,9 @@ def run(person, extra):
     cmd = [sys.executable, os.path.join(HERE, "main.py"), "--headless", *extra]
     if person is not None:
         cmd += ["--person", str(person[0]), str(person[1])]
-    out = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True, timeout=1800).stdout
+    with tempfile.TemporaryDirectory() as tmp:          # PBI-10 state file: keep it out of the repo
+        cmd += ["--state-file", os.path.join(tmp, "mission_state.json")]
+        out = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True, timeout=1800).stdout
     targets = [(float(m.group(1)), float(m.group(2))) for m in
                re.finditer(r"\[map\].*Searching most likely cell \((-?[\d.]+), (-?[\d.]+)\)", out)]
     state = re.search(r"^Mission: (\w+)", out, re.M)
