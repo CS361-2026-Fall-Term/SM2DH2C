@@ -208,7 +208,8 @@ class MissionStateStore:
         Returns True when a file was written."""
         fp = (mission.state, tuple(mission.plan), tuple(mission.visited),
               tuple(mission.destination) if mission.destination else None,
-              mission.response, len(mission.history))
+              mission.response, len(mission.history), mission.history[-1] if mission.history else None)
+        
         now = self.clock()
         changed = fp != self._fingerprint
         due = mission.state == "SEARCHING" and now - self._last_save_t >= PERIODIC_SAVE_S

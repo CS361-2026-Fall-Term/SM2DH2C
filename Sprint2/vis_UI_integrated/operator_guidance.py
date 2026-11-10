@@ -182,7 +182,7 @@ class Mission:
             bad("unknown state")
         for key in ("plan", "visited"):
             zones = d.get(key)
-            if not isinstance(zones, list) or any(z not in ZONES for z in zones):
+            if not isinstance(zones, list) or any(not isinstance(z,str) or z not in ZONES for z in zones):
                 bad(f"{key} must be a list of known zones")
         if len(set(d["plan"]) | set(d["visited"])) != len(d["plan"]) + len(d["visited"]):
             bad("a zone appears twice in plan/visited")
@@ -215,6 +215,8 @@ class Mission:
         self.response = d["response"]
         self.history = [(float(t), s, m) for t, s, m in d["history"]]
         self._set_dest()
+        if self.state != "SEARCHING":
+            self.destination = None
         note = ""
         saved = tuple(d["destination"]) if d["destination"] else None
         if self.state == "SEARCHING" and saved != self.destination:
