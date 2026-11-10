@@ -11,6 +11,12 @@ Run: python main.py                  (mission setup window, then GUI; press STAR
      python main.py --camera follow            (camera: locked | follow | free - see CAMERA_MODES)
      python main.py --simple-visuals           (flat colours, no textures/tree models/shadows: faster)
      python main.py --person child --exclude-zones AC   (PBI-03: missing person category, zones not searched)
+     python main.py --headless --person -9 -9  (place the person at x=-9, y=-9 sim metres)
+     python main.py --person-seed 42           (repeat a random person location; default: new random spot each run)
+     python main.py --person child -9 -9       (category and position together)
+
+After the zone plan ends, the drone keeps searching the most likely cells of the probability map
+(map_search.py) until the person is found or the time limit is reached.
 
 Search-area size:
   --area      how much ground the search covers, in real metres (MIN_AREA_M..MAX_AREA_M in sim_config).
@@ -18,6 +24,8 @@ Search-area size:
   --map-size  optional override for the sim map width (MIN_MAP_SIZE..MAX_MAP_SIZE).
 """
 import argparse
+import numpy as np
+import random
 import contextlib
 import math
 import time
@@ -28,10 +36,12 @@ import operator_setup
 import osm_world
 import sim_config
 import terrain_prior
+import map_search
 from env_sim import build_world, FLIGHT_PATH, DRONE_START_POS, OBSTACLE_POSITIONS
-from object_avoidance import Navigator, DT
+from object_avoidance import Navigator, DT, V_MAX
 from target_detection import MissingPerson, SearchMonitor
 from operator_guidance import Mission, Cmd, ZONES, ZONE_COMMANDS, scale_zones
+from map_search import MapGuidedSearch, SightingConfirm
 from probability_map import ProbabilityMap
 
 # Mission logic (navigation, detection, probability map) still advances every DT (240 Hz).
@@ -112,14 +122,16 @@ def hud_line_step():
         return (0.0, 0.0, 0.45)
 
 def search_bounds(margins = 3.0):
+    """Search area: a square centred on the LKP (0, 0) that covers the layout (start, trees,
+    flight path) plus `margins`, clamped to the map. It is kept SQUARE AND CENTRED so every zone
+    gets the same amount of area: an off-centre area cut the southern zone squares short, which
+    gave them less probability and always ordered the northern zones first."""
     pts = [DRONE_START_POS] + list(OBSTACLE_POSITIONS) + list(FLIGHT_PATH)
-    xs = [pt[0] for pt in pts]
-    ys = [pt[1] for pt in pts]
+    reach = max(max(abs(pt[0]), abs(pt[1])) for pt in pts) + margins
     # Clamped to the map, so OSM trees near the edge never grow the search area past it.
-    half = sim_config.MAP_HALF
-    return ((max(min(xs) - margins, -half), min(max(xs) + margins, half)),
-            (max(min(ys) - margins, -half), min(max(ys) + margins, half)))
-    # Creates a border w/ padding (3m)
+    h = min(reach, sim_config.MAP_HALF)
+    return ((-h, h), (-h, h))
+
 
 # Zone label colours in the 3D view (PBI-09 operator feedback)
 ZONE_COLOURS = {"next": [0.1, 0.85, 0.1], "planned": [0.3, 0.7, 1.0], "searched": [0.55, 0.55, 0.55],
@@ -203,6 +215,13 @@ def zone_status(mission, name):
     return "next" if mission.plan[:1] == [name] else "planned"
 
 
+def map_status(searcher, mission):
+    """Extra panel status text for the map-guided phase."""
+    if mission.state == "SEARCHING" and searcher.active and searcher.target:
+        return f"   |   Searching most likely cell {map_search.fmt(searcher.target)}"
+    return ""
+
+
 def set_destination(nav, xy):
     """Change high-level destination; Navigator still owns obstacle-safe routing."""
     nav.wps = [(nav.pos[0], nav.pos[1]), tuple(xy)]
@@ -277,6 +296,91 @@ def _free_camera_keys(dt):
                                  cameraTargetPosition=new_target)
 
 
+def parse_person(values):
+    """--person accepts a category, a position X Y (sim metres), or both: 'child', '-9 -9',
+    'child -9 -9'. Returns (category or None, (x, y) or None); raises ValueError."""
+    if not values:
+        return None, None
+    values = list(values)
+    category = None
+    if values[0].lower() in terrain_prior.PERSON_CATEGORIES:
+        category = values.pop(0).lower()
+    if not values:
+        return category, None
+    if len(values) != 2:
+        raise ValueError("give a category, a position X Y, or both (e.g. 'child -9 -9'); "
+                         f"categories: {', '.join(terrain_prior.PERSON_CATEGORIES)}")
+    try:
+        xy = (float(values[0]), float(values[1]))
+    except ValueError:
+        raise ValueError(f"position must be two numbers, got {' '.join(values)}")
+    if not all(math.isfinite(c) for c in xy):
+        raise ValueError("position must be finite numbers")
+    return category, xy
+
+
+PERSON_START_CLEARANCE = 5.0   # m, a random person spot is at least this far from the drone start
+PERSON_TREE_CLEARANCE = 1.0    # m from a trunk (closer = right under the canopy, never visible)
+
+
+def random_person_spot(seed, x_range, y_range, scene=None, margin=1.0, belief=None):
+    """Random (x, y) for the missing person inside the search area: clear of tree trunks,
+    walls, OSM buildings and water, never in a cell the starting heatmap shows red (water,
+    buildings, excluded zones), and not right next to the drone's start. Same seed = same spot.
+    Uniform over the allowed area (not weighted by the map), so tests aren't biased toward it."""
+    rng = random.Random(seed)
+    red = belief.red_mask() if belief is not None else None
+    for _ in range(20000):
+        xy = (round(rng.uniform(x_range[0] + margin, x_range[1] - margin), 2),
+              round(rng.uniform(y_range[0] + margin, y_range[1] - margin), 2))
+        if math.dist(xy, DRONE_START_POS[:2]) < PERSON_START_CLEARANCE:
+            continue
+        if any(math.dist(xy, t[:2]) < PERSON_TREE_CLEARANCE for t in OBSTACLE_POSITIONS):
+            continue
+        if any(abs(xy[0] - wx) < hx + 0.5 and abs(xy[1] - wy) < hy + 0.5
+               for wx, wy, hx, hy, _h in env_sim.WALLS):
+            continue
+        if red is not None:
+            ix, iy = belief.to_cell(xy)
+            if red[iy, ix]:
+                continue
+        if scene is not None and (not osm_world.is_free(scene, xy, margin=1.2) or
+                                  any(osm_world.point_in_polygon(xy, w) for w in scene.water)):
+            continue
+        return xy
+    return tuple(env_sim.TARGET_POSITION[:2])        # nowhere free: the original spot
+
+
+def zones_by_probability(belief, half=None):
+    """Zone names, most likely first: probability-map mass inside each zone's square.
+    Ties keep the A-B-C-D order. Excluded zones have no mass, so they come last."""
+    half = sim_config.MAP_HALF if half is None else half
+    mass = {z: belief.zone_mass(zone_rect(c, half)) for z, c in ZONES.items()}
+    # rounded so floating-point noise doesn't reorder zones that really tie (keeps A-B-C-D)
+    return sorted(ZONES, key=lambda z: -round(mass[z], 3)), mass
+
+
+def zone_terrain_lines(scene, belief, top=4):
+    """One line per zone: what its terrain is made of (share of cells), to explain the order."""
+    terrain = terrain_prior.terrain_grid(scene, belief)
+    lines = []
+    for z, c in ZONES.items():
+        x0, y0, x1, y1 = zone_rect(c, sim_config.MAP_HALF)
+        inside = (belief.cx >= x0) & (belief.cx <= x1) & (belief.cy >= y0) & (belief.cy <= y1)
+        if not inside.any():
+            continue
+        codes, counts = np.unique(terrain[inside], return_counts=True)
+        parts = sorted(zip(counts, codes), reverse=True)[:top]
+        lines.append(f"Zone {z} ({zone_direction(c)}): " + ", ".join(
+            f"{terrain_prior.TERRAIN_NAMES[int(k)]} {n / inside.sum():.0%}" for n, k in parts))
+    return lines
+
+
+def nearest_zone(xy):
+    """(zone name, distance in m) of the zone centre closest to xy."""
+    return min(((z, math.dist(c, xy)) for z, c in ZONES.items()), key=lambda zc: zc[1])
+
+
 def _setup_prefill(args):
     """Command-line values the operator already gave, used to pre-fill the setup window."""
     pre = {}
@@ -293,8 +397,8 @@ def _setup_prefill(args):
         pre["visuals"] = "simple"
     if args.camera or args.free_camera:
         pre["camera"] = args.camera or "free"
-    if args.person:
-        pre["person_category"] = args.person
+    if args.person_category:
+        pre["person_category"] = args.person_category
     if args.exclude_zones:
         pre["exclude_zones"] = args.exclude_zones
     return pre
@@ -329,12 +433,24 @@ def main():
                         help="don't dock the operator panel beside the 3D window")
     parser.add_argument("--no-ui", action="store_true",
                         help="skip the mission setup window and use the command-line options")
-    parser.add_argument("--person", choices=list(terrain_prior.PERSON_CATEGORIES), default=None,
-                        help="missing person category; sets the distance rings of the initial "
-                             f"probability map (default {terrain_prior.DEFAULT_CATEGORY})")
+    parser.add_argument("--person", nargs="+", default=None, metavar="CATEGORY | X Y",
+                        help="missing person category (" + ", ".join(terrain_prior.PERSON_CATEGORIES)
+                             + "; sets the distance rings of the initial probability map, default "
+                             f"{terrain_prior.DEFAULT_CATEGORY}) and/or where to place the person, "
+                             "X Y in sim metres, e.g. --person -9 -9 or --person child -9 -9")
+    parser.add_argument("--person-seed", type=int, default=None,
+                        help="seed for the person's random location (default: a new random seed "
+                             "each run, printed so the run can be repeated); ignored with --person X Y")
+    parser.add_argument("--zone-order", choices=("map", "fixed"), default="map",
+                        help="map = search the zones most likely first (probability map mass, "
+                             "default); fixed = always A -> B -> C -> D")
     parser.add_argument("--exclude-zones", default=None,
                         help="zones not to search, set before the mission, e.g. AC")
     args = parser.parse_args()
+    try:
+        args.person_category, person_xy = parse_person(args.person)
+    except ValueError as exc:
+        parser.error(f"--person: {exc}")
 
     # ---- Mission setup window (issue #55): the operator enters the initial information here,
     # it is validated, and only then is the environment generated. Command-line values pre-fill it.
@@ -354,7 +470,7 @@ def main():
             args.simple_visuals = cfg["simple_visuals"]
             args.camera = cfg.get("camera") or ("free" if cfg.get("free_camera") else "locked")
             args.max_time = cfg["max_time"]
-            args.person = cfg.get("person_category") or args.person
+            args.person_category = cfg.get("person_category") or args.person_category
             args.exclude_zones = cfg.get("exclude_zones") or args.exclude_zones
             setup_summary = cfg.get("summary", "")
             print("Mission setup accepted:", setup_summary)
@@ -362,7 +478,7 @@ def main():
         parser.error("--lat and --lon must be given together")
     if args.osm_file and args.lat is None:
         parser.error("--osm-file needs --lat and --lon (the last known position)")
-    person_category = args.person or terrain_prior.DEFAULT_CATEGORY
+    person_category = args.person_category or terrain_prior.DEFAULT_CATEGORY
     try:
         exclude_zones = operator_setup.parse_zones(args.exclude_zones or "")
     except ValueError as exc:
@@ -406,6 +522,11 @@ def main():
             if tuple(centre) in scene.moved:
                 ZONES[name] = scene.moved[tuple(centre)]
         print("Zones:", ZONES)
+        if not (scene.buildings or scene.trees or scene.roads or scene.water or scene.surfaces):
+            osm_empty = ("no map data around this LKP (0 buildings, trees, roads, water or ground "
+                         "areas). If you picked 'Exported file' in the setup window, check that the "
+                         "file covers this latitude/longitude; otherwise the terrain is all 'open'")
+            print("WARNING: " + osm_empty)
     gui = not args.headless
     render_every = RENDER_EVERY if gui else 1       # headless: no GUI calls, nothing to decimate
     prof = Profiler(args.profile and gui)
@@ -415,10 +536,6 @@ def main():
     # PyBullet's clock equal to wall time.
     p.setTimeStep(DT * render_every)
     p.setRealTimeSimulation(0)
-    person = MissingPerson.spawn()
-    # label_dz lifts the detection label above the Navigator's label so they don't overprint.
-    monitor = SearchMonitor(person, gui=gui, label_dz=1.4)
-
     # Sanity-check for probability map
     x_range, y_range = search_bounds()
     print("Search area:", x_range, y_range)
@@ -432,14 +549,53 @@ def main():
     map_warning = build_initial_belief(belief, scene, person_category)
     for z in exclude_zones:
         belief.exclude_zone(z, zone_rect(ZONES[z], sim_config.MAP_HALF))
+    # The person is placed after the map is built, so a random spot can avoid red cells.
+    if person_xy is None:
+        # No position given: hide the person at a random spot in the search area.
+        person_seed = args.person_seed if args.person_seed is not None else random.randrange(10 ** 6)
+        person_xy = random_person_spot(person_seed, x_range, y_range, scene=scene, belief=belief)
+        print(f"Person placed at random (--person-seed {person_seed}); "
+              f"repeat with --person-seed {person_seed} or --person {person_xy[0]:g} {person_xy[1]:g}")
+    if person_xy is not None:
+        half = sim_config.MAP_HALF
+        if not (-half < person_xy[0] < half and -half < person_xy[1] < half):
+            parser.error(f"--person: ({person_xy[0]:g}, {person_xy[1]:g}) is outside the "
+                         f"{2 * half:g} m map (x and y must be between {-half:g} and {half:g})")
+        if scene is not None:                       # OSM world: not inside a building
+            free = osm_world.nearest_free_point(scene, person_xy, margin=1.2)
+            if math.dist(free, person_xy) > 1e-6:
+                print(f"Person moved from {map_search.fmt(person_xy)} to {map_search.fmt(free)} "
+                      "(was inside a building)")
+            person_xy = tuple(free)
+        if belief.red_mask()[belief.to_cell(person_xy)[::-1]]:
+            print(f"Warning: the person is in a red cell (water, building or excluded zone): "
+                  "the map rates it as almost impossible, so the drone will search it last")
+        z, d = nearest_zone(person_xy)
+        print(f"Person placed at {map_search.fmt(person_xy)}, {d:.1f} m from the nearest zone "
+              f"centre (zone {z})")
+    person = MissingPerson.spawn(person_xy)
+    # label_dz lifts the detection label above the Navigator's label so they don't overprint.
+    monitor = SearchMonitor(person, gui=gui, label_dz=1.4)
+
+    if person_xy is not None and not (x_range[0] <= person_xy[0] <= x_range[1]
+                                      and y_range[0] <= person_xy[1] <= y_range[1]):
+        print(f"Warning: the person is outside the search area {x_range} x {y_range}; "
+              "the probability map will never send the drone there")
     if gui:
         # Build all heatmap tiles once, up front, with rendering off so there is no
         # mid-mission freeze when the first tiles are created.
         p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0)
-        belief.draw_heatmap()
+        belief.draw_heatmap(budget=belief.grid.size)          # paint every tile once
         p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
 
     mission = Mission()
+    if args.zone_order == "map":
+        order, mass = zones_by_probability(belief)
+        print("Zone order by probability: " + " -> ".join(f"{z} ({mass[z]:.0%})" for z in order))
+        if scene is not None:
+            for line in zone_terrain_lines(scene, belief):
+                print("  " + line)
+        mission.set_plan_order(order)
     if setup_summary is not None:
         mission.response = "Setup accepted - environment generated. Press START MISSION"
     if map_warning:
@@ -450,6 +606,17 @@ def main():
     nav.route = []
     nav.state = "IDLE"
     nav.alt = 2.5
+    # Map-guided search (runs once the zone plan is finished). A viewpoint must be clear of
+    # obstacles the drone has already sensed.
+    def viewpoint_blocked(x, y):
+        """A viewpoint must be clear of obstacles already sensed and of OSM buildings (even ones
+        not sensed yet), or the drone flies into a building and has to climb / abort."""
+        if nav.map.blocked(x, y, nav.alt):
+            return True
+        return scene is not None and not osm_world.is_free(scene, (x, y), margin=1.0)
+    searcher = MapGuidedSearch(belief, OBSTACLE_POSITIONS, sim_config.MAP_HALF,
+                               blocked=viewpoint_blocked, log=print, speed=V_MAX)
+    confirmer = SightingConfirm()        # stop and look when the detector has a possible sighting
     yaw = 0.0
     previous_xy = nav.pos[:2]
     zone_line_ids = {}                   # zone name -> debug line ids of its outline + pole
@@ -539,11 +706,21 @@ def main():
                         panel.refresh(mission, selected_zone, lambda z: zone_status(mission, z),
                                       last_result, cam_mode,
                                       f"Navigation: {nav.state}   |   Detection: {monitor.state} "
-                                      f"({monitor.confidence:.2f})")
+                                      f"({monitor.confidence:.2f})" + map_status(searcher, mission))
 
             with prof.section("logic"):
+                holding = False
                 if mission.state == "SEARCHING":
-                    if nav.state in ("NAV", "CLIMB", "RTL"):
+                    was = confirmer.active
+                    holding = confirmer.update(monitor.state, monitor._current_estimate(),
+                                               nav.pos, yaw, DT, nav.t)
+                    if holding and not was:
+                        print(f"[confirm] t={nav.t:.1f}s possible sighting - holding position "
+                              "to confirm")
+                    if holding:
+                        nav.t += DT                    # hover: the route is kept, resumed after
+                        nav.horizontal_speed = 0.0
+                    elif nav.state in ("NAV", "CLIMB", "RTL"):
                         nav.update(DT)
                     else:
                         nav.t += DT
@@ -552,18 +729,29 @@ def main():
                         mission.arrived()
                         if mission.destination:
                             set_destination(nav, mission.destination)
-                    # A completed plan remains completed; don't restart it.
+                    # The operator put a zone back in the plan: zones come first again.
+                    if mission.destination and searcher.active:
+                        searcher.cancel()
                     if nav.state == "ABORT":
                         mission.state = "ABORT"
                         mission.response = "Navigation aborted: awaiting operator"
                     elif nav.state == "RTL_DONE":
                         mission.state = "COMPLETE"
                         mission.response = "Returned to launch"
-                    elif nav.state == "DONE" and not mission.destination:
-                        target = belief.best_target(nav.pos[:2], distance_weight=0.1)
-                        set_destination(nav, target)
-                        mission.state = "COMPLETE"
-                        mission.response = f'Search plan complete; person not confirmed, but most likely in cell {target}'
+                    elif nav.state == "DONE" and not mission.destination and not holding:
+                        # Map-guided phase: the zone plan is finished, keep searching the most
+                        # likely cells of the probability map. The mission stays SEARCHING.
+                        if not searcher.active:
+                            print(f"[map] zone plan finished at t={nav.t:.1f}s - "
+                                  "searching the probability map")
+                        vp = searcher.update(nav.pos, yaw, DT, nav.t,
+                                             sighting=monitor.state == "SIGHTING",
+                                             in_view=lambda pt: monitor.in_frustum(nav.pos, pt))
+                        if vp is not None:
+                            set_destination(nav, vp)
+                            msg = mission.search_cell(searcher.target)
+                            print(f"[map] t={nav.t:6.1f}s {msg} (look from {map_search.fmt(vp)})")
+                            force_hud = True
 
                 else:
                     nav.t += DT
@@ -576,6 +764,14 @@ def main():
                     yaw_error = (desired_yaw - yaw + math.pi) % (2 * math.pi) - math.pi
                     max_turn = 1.5 * DT  # rad/s
                     yaw += max(-max_turn, min(max_turn, yaw_error))
+                elif holding:
+                    # confirming a possible sighting: face the detector's estimate
+                    yaw = confirmer.heading
+                    monitor.set_heading(yaw)
+                elif searcher.phase == "LOOK" and mission.state == "SEARCHING":
+                    # hovering at a map-guided viewpoint: turn the nose and camera to the target
+                    yaw = searcher.heading
+                    monitor.set_heading(yaw)
                 previous_xy = nav.pos[:2]
 
             # Push the drone pose and step the world once per render tick, not every logic step.
@@ -607,7 +803,9 @@ def main():
                 if (step_count // render_every) % HUD_EVERY == 0 or force_hud:
                     force_hud = False
                     with prof.section("hud"):
-                        nxt = f"Zone {mission.plan[0]}" if mission.plan else "none"
+                        nxt = (f"Zone {mission.plan[0]}" if mission.plan else
+                               f"map cell {map_search.fmt(searcher.target)}" if searcher.active
+                               else "none")
                         # PyBullet debug text ignores "\n", so each HUD line is its own
                         # text item, stacked downward. Only changed lines are re-sent.
                         info = [f"Mission: {mission.state} | Nav: {nav.state} | "
@@ -695,6 +893,9 @@ def main():
             step_count += 1
             if not gui and mission.state in ("FOUND", "ABORT", "COMPLETE"):
                 break
+        # Time limit reached without a find: end the search and report where to look next.
+        if p.isConnected() and nav.t >= max_time and mission.state == "SEARCHING":
+            mission.time_up(searcher.most_likely())
             # Pace once per render tick, at the end of the group of logic steps, so the next
             # render step (pose push, camera) lands on a steady 60 Hz deadline.
             if gui and step_count % render_every == 0:
@@ -714,7 +915,12 @@ def main():
         if panel is not None:
             panel.close()
         prof.report()
-        print("Mission:", mission.state, "| Navigation:", nav.state)
+        print("Mission:", mission.state, "| Navigation:", nav.state, f"| sim time {nav.t:.1f} s")
+        print("Final report:", mission.response)
+        if searcher.selections:
+            print(f"Map-guided search: {len(searcher.selections)} targets selected, "
+                  f"{sum(1 for r in searcher.log_rows if r[3])}/{len(searcher.log_rows)} looks "
+                  "had the target cell in the camera view")
         print("Detection:", monitor.report())
         print("Events:", mission.history)
         if confirm_times_ms:

@@ -13,6 +13,9 @@ Detection itself is handled by SearchMonitor; this map only guides where to look
 import numpy as np
 import pybullet as p
 
+# Detection chance at the far edge of the camera view, as a share of the close-up chance (pod).
+FAR_POD_FACTOR = 0.35
+
 HEATMAP_Z = 0.10   # above the OSM ground layers (roads, grass, parking... top out at ~0.08 m)
 
 
@@ -182,9 +185,10 @@ class ProbabilityMap:
             mask |= (self.cx - t[0]) ** 2 + (self.cy - t[1]) ** 2 <= canopy_radius ** 2
         return mask
 
-    def frustum_mask(self, monitor, cam, ground_z=0.3):
+    def frustum_mask(self, monitor, cam, ground_z=0.3, return_dist=False):
         """Vectorized version of monitor.in_frustum for every cell at once.
-        Same pinhole FOV + max-range test as SearchMonitor.in_frustum, one numpy pass."""
+        Same pinhole FOV + max-range test as SearchMonitor.in_frustum, one numpy pass.
+        return_dist=True also returns each cell's distance from the camera."""
         f, r, u = monitor._axes()
         vx = self.cx - cam[0]
         vy = self.cy - cam[1]
@@ -195,7 +199,8 @@ class ProbabilityMap:
         xu = vx * u[0] + vy * u[1] + vz * u[2]
         ok = (dist <= monitor.range) & (dist >= 1e-6) & (xf > 0.05)
         safe_xf = np.where(ok, xf, 1.0)                  # avoid dividing by ~0 outside the view
-        return ok & (np.abs(xr / safe_xf) <= monitor.tan_h) & (np.abs(xu / safe_xf) <= monitor.tan_v)
+        mask = ok & (np.abs(xr / safe_xf) <= monitor.tan_h) & (np.abs(xu / safe_xf) <= monitor.tan_v)
+        return (mask, dist) if return_dist else mask
 
     def observe_camera(self, monitor, drone_pos, dt, trees=(), canopy_radius=1.0,
                        canopy_pod=0.3, ground_z=0.3):
@@ -203,15 +208,19 @@ class ProbabilityMap:
 
         Uses SearchMonitor's frustum (forward-tilted wedge, FOV + max range). Cells under a
         tree canopy use a lower detection probability.
-        pod and canopy_pod are per-SECOND detection chances while a cell is in view; each
-        call applies (1 - pod) ** dt, so the result does not depend on the step size.
+        pod and canopy_pod are per-SECOND detection chances while a cell is in view, for a cell
+        right in front of the camera. Farther cells get less, with the same falloff the detector
+        uses for its score (target_detection: quality = 1 - (dist / range)^2, at least 0.2), so a
+        glimpse at the edge of the view does not rule a cell out as fast as a close look.
+        Each call applies (1 - pod) ** dt, so the result does not depend on the step size.
         """
         if not hasattr(self, "_canopy"):
             self._canopy = self._build_canopy_mask(trees, canopy_radius)
-        seen = self.frustum_mask(monitor, drone_pos, ground_z)
+        seen, dist = self.frustum_mask(monitor, drone_pos, ground_z, return_dist=True)
         if not seen.any():
             return
-        pod = np.where(self._canopy, canopy_pod, self.pod)
+        quality = np.clip(1.0 - (dist / monitor.range) ** 2, FAR_POD_FACTOR, 1.0)
+        pod = np.where(self._canopy, canopy_pod, self.pod) * quality
         self.grid[seen] *= ((1.0 - pod) ** dt)[seen]
         self._normalize()
 
@@ -223,14 +232,35 @@ class ProbabilityMap:
         self._normalize()
 
     # ---------- queries ----------
-    def best_target(self, from_xy=None, distance_weight=0.0):
-        """World (x, y) of the most promising cell. distance_weight > 0 favors nearby cells."""
+    def best_target(self, from_xy=None, distance_weight=0.0, min_dist=0.0, skip=()):
+        """World (x, y) of the most promising cell. distance_weight > 0 favors nearby cells.
+        min_dist: ignore cells closer than this to from_xy (map-guided search: no 'go nowhere'
+        targets). skip: (ix, iy) cells to leave out. Excluded cells are never returned, and the
+        result is always a cell centre, so it is inside the search bounds. Returns None only if
+        every cell is excluded or skipped."""
+        cell = self.best_cell(from_xy, distance_weight, min_dist, skip)
+        return None if cell is None else self.to_world(*cell)
+
+    def best_cell(self, from_xy=None, distance_weight=0.0, min_dist=0.0, skip=()):
+        """(ix, iy) of the cell best_target() picks, or None (see best_target)."""
         score = self.grid.copy()
-        if from_xy is not None and distance_weight > 0:
+        if from_xy is not None:
             d = np.hypot(self.cx - from_xy[0], self.cy - from_xy[1])
-            score = score / (1 + distance_weight * d)
+            if distance_weight > 0:
+                score = score / (1 + distance_weight * d)
+            if min_dist > 0:
+                score[d < min_dist] = -1.0
+        for ix, iy in skip:
+            score[iy, ix] = -1.0
+        score[self.excluded] = -1.0
         iy, ix = np.unravel_index(np.argmax(score), score.shape)
-        return self.to_world(ix, iy)
+        if score[iy, ix] < 0:
+            return None
+        return int(ix), int(iy)
+
+    def zone_mass(self, rect):
+        """Probability that the person is inside rect (x0, y0, x1, y1)."""
+        return float(self.grid[self._box(rect)].sum())
 
     def mass_near(self, xy, radius):
         """Total probability inside a circle (used for ranking search zones)."""
@@ -257,10 +287,10 @@ class ProbabilityMap:
                 self._line_ids.append(p.addUserDebugLine(start, end, color, lineWidth=3))
 
     def draw_heatmap(self, alpha=0.45, levels=8, budget=40):
-        """Ground heatmap over every cell:
-             red    = ruled out (searched with no find, or excluded)
-             orange = less likely
-             yellow = possible location
+        """Ground heatmap over every cell, scaled to the most likely cell (log scale, 2 decades):
+             green  = most likely (the brightest green is the cell best_target() would pick)
+             yellow = about a tenth as likely as the best cell
+             red    = 1/100 of the best cell or less: ruled out (searched with no find, or excluded)
         Tiles are visual-only (no collision), so they do not block camera rays
         or obstacle sensing. Only tiles whose color changed are updated, and at most
         `budget` tiles are recolored per call (largest color changes first) so the cost
@@ -271,8 +301,8 @@ class ProbabilityMap:
             vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[half, half, 0.005],
                                       rgbaColor=[1, 1, 0, alpha])
             self._tiles = np.empty(self.grid.shape, dtype=int)
-            # tiles are created yellow, which is level (levels - 1)
-            self._tile_level = np.full(self.grid.shape, levels - 1, dtype=int)
+            # tiles are created yellow (the middle level); force a full first paint
+            self._tile_level = np.full(self.grid.shape, -1, dtype=int)
             for iy in range(self.ny):
                 for ix in range(self.nx):
                     self._tiles[iy, ix] = p.createMultiBody(
@@ -284,12 +314,7 @@ class ProbabilityMap:
         if not self.heatmap_visible:
             return
 
-        allowed = ~self.excluded
-        mean = self.grid[allowed].mean() if allowed.any() else 1.0
-        # ratio >= 1: at least as likely as an average allowed cell -> yellow
-        ratio = np.clip(self.grid / max(mean, 1e-12), 0.0, 1.0)
-        level = np.round(ratio * (levels - 1)).astype(int)
-        level[self.excluded] = 0
+        level = self.heat_levels(levels)
 
         diff = np.argwhere(level != self._tile_level)
         if len(diff) == 0:
@@ -298,9 +323,26 @@ class ProbabilityMap:
             change = np.abs(level - self._tile_level)[diff[:, 0], diff[:, 1]]
             diff = diff[np.argsort(-change, kind="stable")[:budget]]
         for iy, ix in diff:
-            v = level[iy, ix] / (levels - 1)          # 0 = red, 1 = yellow
-            p.changeVisualShape(int(self._tiles[iy, ix]), -1, rgbaColor=[1.0, v, 0.0, alpha])
+            v = level[iy, ix] / (levels - 1)          # 0 = red, 0.5 = yellow, 1 = green
+            p.changeVisualShape(int(self._tiles[iy, ix]), -1, rgbaColor=heat_colour(v, alpha))
             self._tile_level[iy, ix] = level[iy, ix]   # remember per tile, not all at once
+
+    def heat_levels(self, levels=8):
+        """Heatmap colour level of every cell, 0 (red) .. levels - 1 (green).
+        Relative to the BEST cell, on a log scale: 1 -> green, 0.1 -> yellow, <= ~0.01 -> red.
+        (Scaling to the mean made every above-average cell the same colour, hiding the peak.)"""
+        allowed = ~self.excluded
+        top = self.grid[allowed].max() if allowed.any() else 1.0
+        ratio = np.maximum(self.grid / max(top, 1e-12), 1e-12)
+        frac = np.clip(1.0 + np.log10(ratio) / 2.0, 0.0, 1.0)
+        level = np.round(frac * (levels - 1)).astype(int)
+        level[self.excluded] = 0
+        return level
+
+    def red_mask(self):
+        """Cells the heatmap shows red: excluded, or (almost) no chance the person is there
+        (water, buildings, or ruled out by searching)."""
+        return self.heat_levels() == 0
 
     def set_heatmap_visible(self, visible):
         """Show or hide the heatmap (operator toggle), e.g. to see the real map underneath.
@@ -314,3 +356,9 @@ class ProbabilityMap:
         else:
             for tile in self._tiles.flat:
                 p.changeVisualShape(int(tile), -1, rgbaColor=[0, 0, 0, 0])
+
+def heat_colour(v, alpha):
+    """Heatmap colour for v in [0, 1]: red (0) -> yellow (0.5) -> green (1)."""
+    if v <= 0.5:
+        return [1.0, 2.0 * v, 0.0, alpha]
+    return [2.0 * (1.0 - v), 1.0 - 0.2 * (v - 0.5) * 2.0, 0.0, alpha]
