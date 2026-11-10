@@ -306,8 +306,10 @@ class SearchMonitor:
             else:
                 self._line_id = p.addUserDebugLine(cam, centre, replaceItemUniqueId=self._line_id, **kw)
         elif self._line_id is not None:
-            p.removeUserDebugItem(self._line_id)
-            self._line_id = None
+            # park the line out of sight instead of deleting it (re-adding debug items over and
+            # over can crash PyBullet's GUI; the map-guided search toggles this often)
+            self._line_id = p.addUserDebugLine([0, 0, -50], [0, 0, -50.01],
+                                               replaceItemUniqueId=self._line_id, **kw)
         txt = f"{self.state}  conf {self.confidence:.2f}/{FOUND_AT:.1f}"
         tk = dict(textColorRGB=color, textSize=1.4)
         pos = [cam[0], cam[1], cam[2] + self.label_dz]

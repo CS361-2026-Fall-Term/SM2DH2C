@@ -85,6 +85,7 @@ class Mission:
     """
     def __init__(self):
         self.state = "IDLE"
+        self.original_plan = list(ORIGINAL_PLAN)   # order "Return to plan" goes back to
         self.plan = list(ORIGINAL_PLAN) # Zones still needed to search, commands can override this.
         self.visited = []               # Zones where drone finished searching.
         self.excluded = []              # Zones the operator removed with "Do not search".
@@ -108,6 +109,18 @@ class Mission:
         """Readable plan for the operator, e.g. 'B -> C -> D' (or 'none')."""
         return " -> ".join(self.plan) if self.plan else "none"
 
+    # Before START: search the zones in this order (e.g. most likely first, from the probability
+    # map). It also becomes the plan that "Return to plan" restores.
+    def set_plan_order(self, order):
+        if self.state != "IDLE":
+            return self._reply("ORDER", f"Rejected: mission is {self.state}")
+        order = list(order)
+        if sorted(order) != sorted(ORIGINAL_PLAN):
+            return self._reply("ORDER", f"Rejected: order must list every zone once ({order})")
+        self.original_plan = order
+        self.plan = list(order)
+        return self._reply("ORDER", f"Zones ordered by probability: {self.plan_text()}")
+
     # Begin the mission, starts the simulation (only starts once, else error message).
     def start(self):
         if self.state != "IDLE":
@@ -130,6 +143,23 @@ class Mission:
         if self.plan:
             self.visited.append(self.plan.pop(0))
         self._set_dest()
+
+    # Called by main.py in the map-guided phase (after the zone plan): the drone is heading to the
+    # most likely cell of the probability map. The mission stays SEARCHING.
+    def search_cell(self, xy):
+        if self.state != "SEARCHING":
+            return self._reply("MAP", f"Rejected: mission is {self.state}")
+        return self._reply("MAP", f"Searching most likely cell ({xy[0]:.1f}, {xy[1]:.1f})")
+
+    # Called by main.py when the time limit is reached without a find.
+    def time_up(self, best_xy):
+        if self.state != "SEARCHING":
+            return self.response
+        self.state = "COMPLETE"
+        self.destination = None
+        where = f"most likely remaining cell ({best_xy[0]:.1f}, {best_xy[1]:.1f})" if best_xy else \
+            "no cell left on the map"
+        return self._reply("TIME", f"Time limit reached - person not found; {where}")
 
     # ------------------------------------------------------------------ operator commands
     @staticmethod
@@ -158,7 +188,7 @@ class Mission:
         if self.state != "SEARCHING":
             return f"mission is {self.state}" + (" - press START first" if self.state == "IDLE" else "")
         if cmd is Cmd.RETURN_PLAN:
-            if not self.excluded and self.plan == [x for x in ORIGINAL_PLAN if x not in self.visited]:
+            if not self.excluded and self.plan == [x for x in self.original_plan if x not in self.visited]:
                 return "already following the original plan"
             return None
         if cmd in (Cmd.INVESTIGATE, Cmd.SEARCH_FIRST, Cmd.AVOID) and z in self.visited:
@@ -199,7 +229,7 @@ class Mission:
             return f"Zone {z} re-included (searched last)", None
         # RETURN_PLAN: rebuild the original order, skipping zones already visited.
         # Undoes earlier reordering and exclusion.
-        self.plan = [x for x in ORIGINAL_PLAN if x not in self.visited]
+        self.plan = [x for x in self.original_plan if x not in self.visited]
         self.excluded = []
         return "Resuming original plan", None
 

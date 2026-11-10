@@ -575,15 +575,21 @@ class Navigator:
 
     # -------------------------------------------------------- GUI drawing --
     def draw_route(self):
+        """Green route lines. Line ids are REUSED (replaceItemUniqueId) and spare ones are parked
+        out of sight, never removed: deleting and re-adding debug items every few seconds (the
+        map-guided search changes destination often) can crash PyBullet's GUI."""
         if not self.gui:
             return
-        for i in self._debug_ids:
-            p.removeUserDebugItem(i)
-        self._debug_ids = []
         pts = [(self.pos[0], self.pos[1])] + [(r[0], r[1]) for r in self.route]
-        for a, b in zip(pts[:-1], pts[1:]):
-            self._debug_ids.append(p.addUserDebugLine([a[0], a[1], self.alt], [b[0], b[1], self.alt],
-                                                      [0, 1, 0], 2.0))
+        segs = [([a[0], a[1], self.alt], [b[0], b[1], self.alt]) for a, b in zip(pts[:-1], pts[1:])]
+        hidden = ([0, 0, -50], [0, 0, -50.01])          # below the ground, zero length
+        for i in range(max(len(segs), len(self._debug_ids))):
+            a, b = segs[i] if i < len(segs) else hidden
+            if i < len(self._debug_ids):
+                self._debug_ids[i] = p.addUserDebugLine(a, b, [0, 1, 0], 2.0,
+                                                        replaceItemUniqueId=self._debug_ids[i])
+            else:
+                self._debug_ids.append(p.addUserDebugLine(a, b, [0, 1, 0], 2.0))
 
     def draw_status(self):
         if not self.gui:
