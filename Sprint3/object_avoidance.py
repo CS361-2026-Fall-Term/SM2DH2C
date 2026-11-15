@@ -1,5 +1,5 @@
 """
-Contributor: Chase Vanderlip Mylan Bui (A* Integration)
+Contributor: Chase Vanderlip Mylan Bui (A* Integration) Diya Deepu (PBI-12)
 File Description: 
 1.Sense: simulated range sensor that uses pybullet ray casts, 
 360 degree x 3 pitch layers and scans around the drone every few physics steps
@@ -56,7 +56,7 @@ V_Z = 1.0                      # m/s vertical speed.
 # Range sensor: a fan of rays around the drone, in 3 pitch layers (up/level/down).
 SENSOR_RANGE = 5.0
 SENSOR_START = 0.30            # Rays start outside the drone's own body.
-YAW_RAYS = 72                  # 5 deg resolution.
+YAW_RAYS = 144                 # Increased from 72 to 144 (2.5 deg) for denser scans on thin objects.
 PITCHES_DEG = (-25.0, 0.0, 25.0)
 
 # Forward corridor: extra rays straight along the direction of travel. Gives the
@@ -478,11 +478,13 @@ class Navigator:
         for i, (uid, _link, _frac, hit, _n) in enumerate(results):
             if uid < 0 or uid == self.drone or uid == self.floor:
                 continue
-            if uid == self.target:                    # the casualty is not an obstacle
+            # AC-02: Target is completely skipped and NEVER registers as an obstacle map hit.
+            if uid == self.target:
                 if not self.target_seen:
                     self.target_seen = True
                     self.event("TARGET", f"casualty sighted near ({hit[0]:.1f}, {hit[1]:.1f})")
                 continue
+            
             self.map.add_hit(hit)
             rng = math.dist(hit, self.pos)            # sensor range to this surface point
             self._identify(uid, hit, rng)
@@ -590,43 +592,62 @@ class Navigator:
     # ----------------------------------------------------------- RESPOND --
     def _replan(self):
         """
-        Plan a detour to the first reachable remaining waypoint at the current altitude.
-        Tries the remaining waypoints in order and uses A* to find an obstacle-free path to each.
-        Waypoints that can't be reached are skipped. In RTL mode the only goal is the launch point.
-        Returns True if a new route was set, False if no remaining waypoint is reachable
-        (on_blocked() then escalates to climbing or return-to-launch).
+        AC-04: Evaluate detours across all valid altitudes to pick the optimal choice.
+        Compare detouring horizontally with climbing vertically based on distance penalties.
+        Waypoints that can't be reached at any altitude up to MAX_ALT are skipped.
+        Returns True if a new route was set, False if no remaining waypoint is reachable.
         """
         start = (self.pos[0], self.pos[1])
-        # The drone is inside an obstacle's safety margin (something was sensed very close, or a
-        # keep-out was widened around it): first back away to the nearest free spot, then plan from
-        # there. A* cannot leave a blocked start cell on its own unless a free cell touches it.
         self._escape = None
         escape = None
         if self.map.blocked(start[0], start[1], self.alt):
             escape = self.map.nearest_free(start, self.alt, max_r=ESCAPE_RADIUS)
             if escape is not None:
                 start = escape
-        # Route entries are (x, y, waypoint index). Detour points have index None, so this
-        # keeps only the real waypoints still ahead of the drone.        
+
         remaining = [r[2] for r in self.route if r[2] is not None]
-        # When returning to launch, the launch point (index -1) is the only goal.        
         if self.state == "RTL":
             remaining = [-1]
+
         for j in remaining:
             goal = self.wps[j] if j >= 0 else (DRONE_START_POS[0], DRONE_START_POS[1])
-            # If the waypoint falls inside an obstacle's safety margin, move it to the
-            # nearest free cell; A* can't plan into a blocked goal.
-            snapped = self.map.nearest_free(goal, self.alt)
-            if snapped is None:
+            
+            best_path = None
+            best_alt = self.alt
+            best_cost = float('inf')
+            best_snapped = None
+            
+            test_alt = self.alt
+            while test_alt <= MAX_ALT + 1e-6:
+                snapped = self.map.nearest_free(goal, test_alt)
+                if snapped is not None:
+                    path = self.map.astar(start, snapped, test_alt)
+                    if path is not None:
+                        pts = [start] + path
+                        horiz_length = sum(math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
+                                     for i in range(1, len(pts)))
+                        
+                        # Apply heavy penalty to test altitudes to factor vertical travel
+                        # extra vertical distance = 2 * difference (climbing up + descending)
+                        vert_dist = (test_alt - self.alt) * 2.0
+                        total_cost = horiz_length + vert_dist
+                        
+                        if total_cost < best_cost:
+                            best_cost = total_cost
+                            best_path = path
+                            best_alt = test_alt
+                            best_snapped = snapped
+                
+                # Check next elevation bracket 
+                test_alt += CLIMB_STEP
+                
+            # If no path exists up to MAX_ALT, skip waypoint
+            if best_path is None:
                 continue
-            # Run A* from the drone's position. No path means try the next waypoint instead.
-            path = self.map.astar(start, snapped, self.alt)
-            if path is None:
-                continue
-            if snapped != goal:
+
+            if best_snapped != goal:
                 self.event("REPLAN", f"waypoint {j} sits inside an obstacle margin; moved to "
-                                     f"({snapped[0]:.1f}, {snapped[1]:.1f})")
-                        # Waypoints still in the route before j had no path: name each one (PBI-04 AC-02).
+                                     f"({best_snapped[0]:.1f}, {best_snapped[1]:.1f})")
             if j >= 0:
                 for s in remaining[:remaining.index(j)]:
                     sx, sy = self.wps[s]
@@ -634,28 +655,30 @@ class Navigator:
                     self.event("UNREACH", f"waypoint {s} at ({sx:.1f}, {sy:.1f}) is unreachable at "
                                           f"alt {self.alt:.1f} m - skipped; heading to waypoint {j}")
 
-            # Build the new route: A* detour points (index None), then the reached waypoint
-            # tagged with its index, then every later waypoint unchanged.            
             route = [(escape[0], escape[1], None)] if escape is not None else []
-            route += [(x, y, None) for (x, y) in path[:-1]]
-            route.append((path[-1][0], path[-1][1], j if j >= 0 else None))
+            route += [(x, y, None) for (x, y) in best_path[:-1]]
+            route.append((best_path[-1][0], best_path[-1][1], j if j >= 0 else None))
             if j >= 0:
                 route += [(self.wps[i][0], self.wps[i][1], i) for i in range(j + 1, len(self.wps))]
+            
             self.route = route
             self._escape = escape
             self.replans += 1
+            
+            if best_alt > self.alt:
+                self.alt = best_alt
+                self.state = "CLIMB"
+                self.event("CLIMB", f"climbing over obstacle to {self.alt:.1f} m (shorter than detour path)")
+            
             if escape is not None:
                 self.event("REPLAN", f"inside a safety margin; backing away to "
                                      f"({escape[0]:.1f}, {escape[1]:.1f}) first")
-            # Log the detour length for the event history.
-            pts = [start] + path
-            length = sum(math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
-                         for i in range(1, len(pts)))
-            self.event("REPLAN", f"detour found: {len(path)} legs, ~{length:.1f} m to waypoint {j} "
+            
+            self.event("REPLAN", f"detour/climb found: {len(best_path)} legs, ~{best_cost:.1f} m cost to waypoint {j} "
                                  f"at alt {self.alt:.1f} m")
             self.draw_route()
             return True
-        # Every remaining waypoint was unreachable at this altitude.        
+            
         return False
 
     def on_blocked(self, reason, emergency=False):
