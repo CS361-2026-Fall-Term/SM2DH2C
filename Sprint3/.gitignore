@@ -2,9 +2,7 @@ last_setup.json
 textures/
 __pycache__/
 *.pyc
-osm_cache/
-route_safety_results/
-geo_avoidance_results/
+c:\Users\marim\Downloads\PBI12_integrated
 # PBI-10 runtime state
 mission_state.json*
 .mission_state.*.tmp

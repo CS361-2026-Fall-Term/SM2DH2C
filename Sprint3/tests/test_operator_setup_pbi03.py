@@ -2,13 +2,15 @@
 Contributors: Sofia Monge and Mylan Bui
 File Description: Unit tests for the PBI-03 inputs of the mission setup window (person category and
 zones to exclude). Tests the validation only; no window is opened.
-Run from the folder holding operator_setup.py and tests/:  python -m unittest discover tests -v
+Run from the Sprint folder:  python -m unittest discover -s tests -v
 """
 import os
 import sys
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # the Sprint folder
+if CODE_DIR not in sys.path:
+    sys.path.insert(0, CODE_DIR)
 import operator_setup as setup  # noqa: E402
 
 

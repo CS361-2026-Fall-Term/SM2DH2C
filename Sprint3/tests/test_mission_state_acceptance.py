@@ -1,6 +1,6 @@
 """
 File Description: Tests for PBI-10 (maintain mission state so a crash does not lose it).
-No PyBullet needed:   python -m unittest tests.test_mission_state_acceptance
+No PyBullet needed. Run from the Sprint folder:   python -m unittest tests.test_mission_state_acceptance -v
 
 Acceptance criteria covered
   AC-01  state is saved within 1 second of any change      -> TestSaveTiming, TestAutosave
@@ -22,11 +22,9 @@ if CODE_DIR not in sys.path:
 
 import argparse
 import json
-import os
 import random
 import statistics
 import subprocess
-import sys
 import tempfile
 import time
 import unittest

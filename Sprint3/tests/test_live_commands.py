@@ -1,7 +1,7 @@
 """
 PBI-09 tests: live commands reaching the drone and the operator (main.apply_operator_command).
 Needs PyBullet installed (main.py imports it); skipped otherwise.
-Run:  python -m unittest tests.test_live_commands -v
+Run from the Sprint folder:  python -m unittest tests.test_live_commands -v
 
 Covers
   AC-01  accepted commands re-route the drone only when its destination changes;
@@ -9,8 +9,14 @@ Covers
   AC-03  input -> applied + confirmation message in well under 1 second
   AC-04  rejected commands leave the drone's route untouched
 """
+import os
+import sys
 import time
 import unittest
+
+CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # the Sprint folder
+if CODE_DIR not in sys.path:
+    sys.path.insert(0, CODE_DIR)
 
 try:
     import main

@@ -11,9 +11,15 @@ SearchMonitor - The mechanism that decides when the person has been FOUND. A sim
                 1. Checks which of the person's sample points (head / torso / feet ...)
                    are inside the camera frustum.
                 2. Ray-casts to each one, so trees and canopies hide the person (occlusion).
+                   A point counts as seen when nothing else is in the way (the ray hits the
+                   person, or gets to the point without hitting anything): the humanoid's thin
+                   limbs leave gaps, and a ray through such a gap is not hidden by anything.
                 3. Turns "how much of the person is visible, from how far" into a score.
                 4. Accumulates the score into a confidence value that also decays when the
                    person is out of view (so one lucky glimpse is not enough).
+                   A CLEAR view (most of the person visible, nothing in front, within
+                   CLEAR_VIEW_RANGE) for CLEAR_VIEW_FRAMES frames in a row is enough on its own:
+                   the person is found right away instead of waiting for the confidence.
                 5. Fuses noisy position measurements into a location estimate.
                 States:  SEARCHING -> SIGHTING (possible) -> FOUND (latched).
                 When FOUND, it records time / drone position / estimated location and calls
@@ -47,7 +53,22 @@ RAY_END_PAD = 0.25             # rays end slightly behind the sample point so th
 # detection / confirmation
 MIN_VISIBLE_FRACTION = 0.20    # at least this share of sample points must be seen for a frame to count
 CONF_GAIN = 1.0                # confidence per second at a perfect score
-CONF_DECAY = 0.5               # confidence lost per second while the person is not seen
+# Range quality: how much one frame counts at a given distance. Full up to FULL_QUALITY_RANGE,
+# then falling linearly to MIN_QUALITY at CAM_RANGE (the person gets smaller in the image).
+# (It used to fall from the drone outwards: 1 - (d / 8)^2, so at 5 m a frame only counted 0.6.)
+FULL_QUALITY_RANGE = 5.0       # m
+MIN_QUALITY = 0.3
+# Clear view: a person seen unobstructed and close enough is found without waiting for the
+# confidence to build up. This is the detection distance threshold for open areas.
+CLEAR_VIEW_RANGE = 6.0         # m, camera to person
+CLEAR_VIEW_MIN_POINTS = 4      # of the 7 sample points, at least this many inside the image ...
+CLEAR_VIEW_FRACTION = 0.75     # ... and at least this share of those not hidden by anything
+CLEAR_VIEW_FRAMES = 3          # frames in a row (0.3 s at 10 fps)
+# Losing sight: the confidence is kept for SIGHTING_MEMORY_S after the last frame that saw the
+# person (a turn or a branch in front for a moment does not throw the sighting away), then
+# decays at CONF_DECAY per second.
+SIGHTING_MEMORY_S = 2.0
+CONF_DECAY = 0.3               # confidence lost per second while the person is not seen
 SIGHTING_ON = 0.25             # confidence at which a "possible sighting" is raised
 SIGHTING_OFF = 0.08            # ... and cleared (hysteresis)
 FOUND_AT = 1.0                 # confidence at which the person is declared FOUND (latched)
@@ -55,6 +76,15 @@ MEAS_SIGMA_BASE = 0.10         # position-measurement noise (m) = base + per_m *
 MEAS_SIGMA_PER_M = 0.05
 
 SEARCHING, SIGHTING, FOUND_STATE = "SEARCHING", "SIGHTING", "FOUND"
+
+
+def range_quality(dist, cam_range=CAM_RANGE):
+    """How much one camera frame counts at this distance (1 = fully, MIN_QUALITY at cam_range)."""
+    if dist <= FULL_QUALITY_RANGE:
+        return 1.0
+    if dist >= cam_range:
+        return MIN_QUALITY
+    return 1.0 - (1.0 - MIN_QUALITY) * (dist - FULL_QUALITY_RANGE) / (cam_range - FULL_QUALITY_RANGE)
 
 
 
@@ -166,6 +196,9 @@ class SearchMonitor:
 
         # statistics
         self.frames = self.frames_in_view = self.frames_seen = self.frames_occluded = 0
+        self.clear_frames = 0         # clear-view frames in a row (see CLEAR_VIEW_*)
+        self.last_seen_t = None       # sim time of the last frame that saw the person
+        self.found_by = None          # "clear view" or "confidence"
         self.first_sighting_time = None
         self.events = []
         self._line_id = None
@@ -227,24 +260,33 @@ class SearchMonitor:
         visible = 0
         if in_view:
             self.frames_in_view += 1
-            froms, tos = [], []
+            froms, tos, reach = [], [], []
             for pt in in_view:
                 d = [pt[i] - cam[i] for i in range(3)]
                 n = math.sqrt(sum(c * c for c in d))
                 d = [c / n for c in d]
                 froms.append([cam[i] + d[i] * RAY_START_OFFSET for i in range(3)])
                 tos.append([pt[i] + d[i] * RAY_END_PAD for i in range(3)])
-            for res in p.rayTestBatch(froms, tos):
-                if res[0] == self.person.body_id:      # first thing the ray hits is the person -> visible
+                # fraction of the ray at which it reaches the sample point
+                reach.append((n - RAY_START_OFFSET) / (n - RAY_START_OFFSET + RAY_END_PAD))
+            for res, at_point in zip(p.rayTestBatch(froms, tos), reach):
+                # visible: the first thing hit is the person, or nothing is hit before the point
+                if res[0] == self.person.body_id or res[0] < 0 or res[2] >= at_point - 1e-3:
                     visible += 1
         frac = visible / len(pts)
         centre = self.person.position
         dist = math.dist(cam, centre)
-        quality = max(0.2, 1.0 - (dist / self.range) ** 2)
+        quality = range_quality(dist, self.range)
         score = frac * quality if frac >= MIN_VISIBLE_FRACTION else 0.0
+
+        # Clear view: enough of the person inside the image and (almost) nothing in front of it.
+        clear = (dist <= CLEAR_VIEW_RANGE and len(in_view) >= CLEAR_VIEW_MIN_POINTS
+                 and visible >= CLEAR_VIEW_FRACTION * len(in_view))
+        self.clear_frames = self.clear_frames + 1 if clear else 0
 
         if score > 0:
             self.frames_seen += 1
+            self.last_seen_t = self.t
             self._add_measurement(centre, dist)
         elif in_view:
             self.frames_occluded += 1
@@ -252,7 +294,7 @@ class SearchMonitor:
         dt = 1.0 / CAM_FPS
         if score > 0:
             self.confidence += CONF_GAIN * score * dt
-        else:
+        elif self.last_seen_t is None or self.t - self.last_seen_t > SIGHTING_MEMORY_S:
             self.confidence = max(0.0, self.confidence - CONF_DECAY * dt)
         self._update_state(cam, score, dist)
         self._draw(cam, centre, score)
@@ -269,6 +311,17 @@ class SearchMonitor:
 
     # ---------------------------------------------------------------- state --
     def _update_state(self, cam, score, dist):
+        if self.clear_frames >= CLEAR_VIEW_FRAMES:
+            # Clear view for long enough: found now (a sighting is logged first if there was none).
+            if self.state == SEARCHING:
+                self.state = SIGHTING
+                if self.first_sighting_time is None:
+                    self.first_sighting_time = self.t
+                self._event("SIGHTING", f"person in clear view, {dist:.1f} m away")
+            self.confidence = max(self.confidence, FOUND_AT)
+            self.found_by = "clear view"
+            self._declare_found(cam)
+            return
         if self.state == SEARCHING and self.confidence >= SIGHTING_ON:
             self.state = SIGHTING
             if self.first_sighting_time is None:
@@ -278,6 +331,7 @@ class SearchMonitor:
             self.state = SEARCHING
             self._event("LOST", "sighting not confirmed, confidence dropped")
         if self.state == SIGHTING and self.confidence >= FOUND_AT:
+            self.found_by = "confidence"
             self._declare_found(cam)
 
     def _declare_found(self, cam):
@@ -287,7 +341,8 @@ class SearchMonitor:
         self.found_drone_pos = list(cam)
         self.estimate = self._current_estimate()
         e = self.estimate
-        self._event("FOUND", f"{self.person.name} confirmed. Estimated location "
+        self._event("FOUND", f"{self.person.name} confirmed ({self.found_by}, "
+                             f"{math.dist(cam, self.person.position):.1f} m away). Estimated location "
                              f"({e[0]:.2f}, {e[1]:.2f}) from {self._n} measurements")
         if self.gui:
             self.person.mark_found()
@@ -325,6 +380,7 @@ class SearchMonitor:
              "frames": self.frames, "frames_in_view": self.frames_in_view,
              "frames_seen": self.frames_seen, "frames_occluded": self.frames_occluded,
              "first_sighting_time": self.first_sighting_time, "found_time": self.found_time,
+             "found_by": self.found_by,
              "true_position": [round(truth[0], 2), round(truth[1], 2)]}
         est = self.estimate or self._current_estimate()
         if est:

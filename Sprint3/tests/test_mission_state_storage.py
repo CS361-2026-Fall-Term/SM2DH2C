@@ -1,12 +1,12 @@
 """
-File Description: EXTRA tests for PBI-10 (mission state saving). They complement test_mission_state.py
-and do not repeat it. No PyBullet needed. Put this file next to mission_state.py and run:
+File Description: Storage tests for PBI-10 (mission state saving): atomic writes, backups, autosave
+triggers, loading damaged files, setup helpers, restore, and real process crashes. They complement
+test_mission_state_acceptance.py and do not repeat it. No PyBullet needed. Run from the Sprint folder:
 
-    python -m unittest -v tests.test_mission_state_storage
+    python -m unittest tests.test_mission_state_storage -v
 
-Every test has an "EXPECT:" comment saying what a passing run means.
-Two tests are marked "EXPECTED TO FAIL TODAY": they target real gaps found while reading the code
-(history cap not noticed by autosave; unhashable zone names crash load()). Everything else should pass.
+Every test has an "EXPECT:" comment saying what a passing run means. The tests once marked
+"EXPECTED TO FAIL" found real bugs that have since been fixed; they all pass now.
 """
 import os
 import sys
@@ -19,9 +19,7 @@ import argparse
 import contextlib
 import io
 import json
-import os
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -268,9 +266,9 @@ class TestAutosaveTriggers(unittest.TestCase):
             self.assertEqual(store.saves, 1)
 
     def test_new_history_entry_is_saved_even_when_history_is_at_its_cap(self):
-        # EXPECTED TO FAIL TODAY. At HISTORY_LIMIT the log length stops changing, and the autosave
+        # (Found a bug, now fixed.) At HISTORY_LIMIT the log length stops changing, and the autosave
         # fingerprint only looks at len(history), so a new entry (with an unchanged response) is not saved.
-        # Fix idea: put history[-1] (or a running counter) into the fingerprint in autosave().
+        # The fix: put history[-1] (or a running counter) into the fingerprint in autosave().
         with tempfile.TemporaryDirectory() as tmp:
             store, m = new_store(tmp), Mission()
             for i in range(og.HISTORY_LIMIT + 5):
@@ -368,9 +366,9 @@ class TestLoadBehaviour(unittest.TestCase):
             self.assertIn("drone.pos", " ".join(got.problems))
 
     def test_signed_data_with_unhashable_zone_names_does_not_raise(self):
-        # EXPECTED TO FAIL TODAY (load() raises TypeError). A file whose checksum is valid but whose plan
+        # (Found a bug, now fixed: load() used to raise TypeError.) A file whose checksum is valid but whose plan
         # contains e.g. [1] makes `z not in ZONES` raise TypeError instead of ValueError, so load() crashes.
-        # Fix idea: in Mission.validate_snapshot use `not isinstance(z, str) or z not in ZONES`.
+        # The fix: in Mission.validate_snapshot use `not isinstance(z, str) or z not in ZONES`.
         with tempfile.TemporaryDirectory() as tmp:
             store, m = new_store(tmp), started()
             store.save(store.build(m))
@@ -462,9 +460,9 @@ class TestMissionRestore(unittest.TestCase):
                 self.assertEqual(m2.history[-1][1], "RESTORE")
 
     def test_restored_ended_mission_has_no_destination(self):
-        # EXPECTED TO FAIL TODAY for FOUND/ABORT: restore() always calls _set_dest(), so a finished mission
+        # (Found a bug, now fixed, for FOUND/ABORT): restore() always calls _set_dest(), so a finished mission
         # whose plan is not empty gets destination = first zone instead of None (HUD would show a destination).
-        # Fix idea: in restore(), set self.destination = None when self.state != "SEARCHING".
+        # The fix: in restore(), set self.destination = None when self.state != "SEARCHING".
         for name in ("FOUND", "ABORT", "COMPLETE"):
             with self.subTest(state=name):
                 m = self.missions()[name]

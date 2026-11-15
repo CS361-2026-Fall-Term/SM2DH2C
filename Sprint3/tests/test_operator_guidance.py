@@ -1,15 +1,21 @@
 """
 PBI-09 tests: live operator commands for every zone, safety rules, timing.
-No simulator needed.   Run:  python -m unittest tests.test_operator_guidance -v
+No simulator needed.   Run from the Sprint folder:  python -m unittest tests.test_operator_guidance -v
 
 Covers
   AC-01  every command works for every zone and changes the plan correctly
   AC-02  every safety rule rejects bad commands; validation < 10 ms; rejected = nothing changes
   AC-04  bad input of any kind returns an error message and never raises (no crash)
 """
+import os
 import random
+import sys
 import time
 import unittest
+
+CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # the Sprint folder
+if CODE_DIR not in sys.path:
+    sys.path.insert(0, CODE_DIR)
 
 import operator_guidance as og
 from operator_guidance import Cmd, Mission, ZONES, ZONE_COMMANDS, ORIGINAL_PLAN

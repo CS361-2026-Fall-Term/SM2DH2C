@@ -18,7 +18,6 @@ if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
 import math
-import os
 import random
 import unittest
 
