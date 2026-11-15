@@ -1,0 +1,53 @@
+<?xml version="1.0"?>
+<robot name="realistic_quadcopter">
+  <material name="dark_grey"><color rgba="0.15 0.15 0.15 1"/></material>
+  <material name="carbon"><color rgba="0.2 0.2 0.2 1"/></material>
+  <material name="motor_silver"><color rgba="0.8 0.8 0.8 1"/></material>
+  <link name="base_link">
+    <inertial><origin xyz="0 0 0"/><mass value="0.7"/><inertia ixx="0.002" ixy="0" ixz="0" iyy="0.002" iyz="0" izz="0.004"/></inertial>
+    <visual><geometry><cylinder radius="0.08" length="0.04"/></geometry><material name="dark_grey"/></visual>
+    <collision><geometry><cylinder radius="0.08" length="0.04"/></geometry></collision>
+  </link>
+  <link name="arm_fl"><inertial><mass value="0.01"/><inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/></inertial>
+    <visual><origin xyz="0.07 0.07 0" rpy="0 1.5708 0.7854"/><geometry><cylinder radius="0.008" length="0.12"/></geometry><material name="carbon"/></visual>
+    <visual><origin xyz="0.11 0.11 0.015"/><geometry><cylinder radius="0.015" length="0.03"/></geometry><material name="motor_silver"/></visual>
+  </link>
+  <joint name="base_to_arm_fl" type="fixed"><parent link="base_link"/><child link="arm_fl"/></joint>
+  <link name="arm_fr"><inertial><mass value="0.01"/><inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/></inertial>
+    <visual><origin xyz="0.07 -0.07 0" rpy="0 1.5708 -0.7854"/><geometry><cylinder radius="0.008" length="0.12"/></geometry><material name="carbon"/></visual>
+    <visual><origin xyz="0.11 -0.11 0.015"/><geometry><cylinder radius="0.015" length="0.03"/></geometry><material name="motor_silver"/></visual>
+  </link>
+  <joint name="base_to_arm_fr" type="fixed"><parent link="base_link"/><child link="arm_fr"/></joint>
+  <link name="arm_bl"><inertial><mass value="0.01"/><inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/></inertial>
+    <visual><origin xyz="-0.07 0.07 0" rpy="0 1.5708 2.3562"/><geometry><cylinder radius="0.008" length="0.12"/></geometry><material name="carbon"/></visual>
+    <visual><origin xyz="-0.11 0.11 0.015"/><geometry><cylinder radius="0.015" length="0.03"/></geometry><material name="motor_silver"/></visual>
+  </link>
+  <joint name="base_to_arm_bl" type="fixed"><parent link="base_link"/><child link="arm_bl"/></joint>
+  <link name="arm_br"><inertial><mass value="0.01"/><inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/></inertial>
+    <visual><origin xyz="-0.07 -0.07 0" rpy="0 1.5708 -2.3562"/><geometry><cylinder radius="0.008" length="0.12"/></geometry><material name="carbon"/></visual>
+    <visual><origin xyz="-0.11 -0.11 0.015"/><geometry><cylinder radius="0.015" length="0.03"/></geometry><material name="motor_silver"/></visual>
+  </link>
+  <joint name="base_to_arm_br" type="fixed"><parent link="base_link"/><child link="arm_br"/></joint>
+  <link name="nose_cone"><inertial><mass value="0.01"/><inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/></inertial><visual><origin xyz="0.07 0 0.01"/><geometry><box size="0.03 0.04 0.02"/></geometry><material name="bright_red"><color rgba="0.9 0.1 0.1 1"/></material></visual></link>
+  <joint name="base_to_nose" type="fixed"><parent link="base_link"/><child link="nose_cone"/></joint>
+  <link name="landing_gear"><inertial><mass value="0.01"/><inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/></inertial>
+    <visual><origin xyz="0 0.04 -0.04" rpy="0 1.5708 0"/><geometry><cylinder radius="0.004" length="0.12"/></geometry><material name="dark_grey"/></visual>
+    <visual><origin xyz="0 -0.04 -0.04" rpy="0 1.5708 0"/><geometry><cylinder radius="0.004" length="0.12"/></geometry><material name="dark_grey"/></visual>
+  </link>
+  <joint name="base_to_gear" type="fixed"><parent link="base_link"/><child link="landing_gear"/></joint>
+  <!-- Visual-only details: spinning-blur propeller discs and a camera gimbal (no collision). -->
+  <material name="prop_blur"><color rgba="0.1 0.1 0.1 0.35"/></material>
+  <material name="lens"><color rgba="0.05 0.08 0.12 1"/></material>
+  <link name="propellers"><inertial><mass value="0.01"/><inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/></inertial>
+    <visual><origin xyz="0.11 0.11 0.034"/><geometry><cylinder radius="0.06" length="0.003"/></geometry><material name="prop_blur"/></visual>
+    <visual><origin xyz="0.11 -0.11 0.034"/><geometry><cylinder radius="0.06" length="0.003"/></geometry><material name="prop_blur"/></visual>
+    <visual><origin xyz="-0.11 0.11 0.034"/><geometry><cylinder radius="0.06" length="0.003"/></geometry><material name="prop_blur"/></visual>
+    <visual><origin xyz="-0.11 -0.11 0.034"/><geometry><cylinder radius="0.06" length="0.003"/></geometry><material name="prop_blur"/></visual>
+  </link>
+  <joint name="base_to_props" type="fixed"><parent link="base_link"/><child link="propellers"/></joint>
+  <link name="camera_gimbal"><inertial><mass value="0.01"/><inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/></inertial>
+    <visual><origin xyz="0.05 0 -0.03"/><geometry><sphere radius="0.018"/></geometry><material name="dark_grey"/></visual>
+    <visual><origin xyz="0.066 0 -0.036" rpy="0 1.5708 0"/><geometry><cylinder radius="0.008" length="0.006"/></geometry><material name="lens"/></visual>
+  </link>
+  <joint name="base_to_gimbal" type="fixed"><parent link="base_link"/><child link="camera_gimbal"/></joint>
+</robot>
