@@ -1,0 +1,5 @@
+last_setup.json
+textures/
+__pycache__/
+generated_obstacles/
+geo_avoidance_results/
