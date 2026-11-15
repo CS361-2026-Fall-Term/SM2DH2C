@@ -1,5 +1,5 @@
 """
-Contributor: Chase Vanderlip Mylan Bui (A* Integration)
+Contributor: Chase Vanderlip Mylan Bui (A* Integration) Diya Deepu (PBI-12)
 File Description: 
 1.Sense: simulated range sensor that uses pybullet ray casts, 
 360 degree x 3 pitch layers and scans around the drone every few physics steps
@@ -56,8 +56,20 @@ V_Z = 1.0                      # m/s vertical speed.
 # Range sensor: a fan of rays around the drone, in 3 pitch layers (up/level/down).
 SENSOR_RANGE = 5.0
 SENSOR_START = 0.30            # Rays start outside the drone's own body.
-YAW_RAYS = 72                  # 5 deg resolution.
+YAW_RAYS = 72                  # 5 deg all round (PBI-12: kept; extra density only where it matters, ahead)
 PITCHES_DEG = (-25.0, 0.0, 25.0)
+
+# PBI-12: dense forward fan. Thin or narrow obstacles (poles, fences, thin walls) can slip between
+# the 5 deg all-round rays: at 5 m two neighbouring rays are 0.44 m apart. The drone only flies
+# forward, so extra rays are added in a +-30 deg fan around the direction of travel only, 1.5 deg
+# apart (0.13 m at 5 m). 41 extra rays: +19% rays per scan (PBI-12 AC-03: scan time within +20%).
+FWD_FAN_HALF_DEG = 30.0
+FWD_FAN_STEP_DEG = 1.5
+FWD_FAN_PITCHES_DEG = (0.0,)
+# "enhanced" (PBI-12) or "baseline" (the sensor as it was before PBI-12: 72 all-round rays x 3
+# pitches + 3 corridor rays, ray directions recomputed every scan). Kept for the AC-03 comparison.
+SENSOR_MODE = "enhanced"
+BASELINE_YAW_RAYS = 72
 
 # Forward corridor: extra rays straight along the direction of travel. Gives the
 # distance to whatever is directlly in the waym and drives slow-down.
@@ -83,6 +95,25 @@ GOAL_PROBE_CELLS = 2000        # PBI-04 AC-03: max cells the "is the goal walled
 # Reacting to blocked route.
 CLIMB_STEP = 1.0               # Metres gained per climb attempt.
 MAX_ALT = 5.5                  # Climb threshold, don't go over this.
+
+# PBI-12 AC-04: climb over an obstacle or go around it. When the route is blocked, replan() also
+# tries higher flight levels (cruise + 0.5 m, + 1 m, ... up to MAX_ALT) and picks the cheapest:
+#   cost = level distance + CLIMB_COST x metres climbed + DESCEND_COST x metres descended
+# The drone stops to climb at V_Z = 1 m/s, so 1 m of climb takes as long as V_MAX / V_Z = 2 m of
+# level flight; descending back to cruise happens while it flies on, so it costs less (battery,
+# and the camera sees less from higher up). A change of altitude is only made when it saves at
+# least CLIMB_MIN_SAVING_M and CLIMB_MIN_SAVING_FRAC of staying level, so the drone goes round
+# a single tree but over a long row of them, and does not hop up and down.
+# Only obstacles whose top is KNOWN can be flown over: a mapped obstacle's height comes from the
+# map (geo_obstacles); a surface not in the map is assumed to reach above MAX_ALT. The drone must
+# also pass VERT_CLEAR above the top, so with MAX_ALT 5.5 m it can fly over obstacles up to
+# 4.75 m (trees 3 m, the 4 m garage) but never over a 7-8 m building.
+CLIMB_OVER = True              # False = detour only at the current altitude (before PBI-12)
+FLIGHT_LEVEL_STEP = 0.5        # spacing of the altitudes replan() tries
+CLIMB_COST = V_MAX / V_Z       # 2.0
+DESCEND_COST = 1.0
+CLIMB_MIN_SAVING_M = 2.0
+CLIMB_MIN_SAVING_FRAC = 0.2
 REPLAN_COOLDOWN = 0.5          # s between sensor-triggered re-plans (hard stops ignore this).
 
 # GUI obstacle-hit marks (drawing only, no effect on navigation).
@@ -100,6 +131,9 @@ KEEPOUT_EXTRA = 0.25           # Extra margin (one map cell) put around a surfac
 ESCAPE_RADIUS = 2.0            # How far to look for a free spot when the drone is inside a margin.
 
 
+# Top assumed for a surface whose height is unknown: above anything the drone may fly at.
+UNKNOWN_TOP = MAX_ALT + VERT_CLEAR + Z_BUCKET
+
 # Mapped buildings / walls (add_footprint): cells whose centre is within this distance of the
 # outline are blocked, so no point of a free cell is within SAFETY_RADIUS of the wall.
 FOOTPRINT_REACH = SAFETY_RADIUS + CELL * math.sqrt(0.5)
@@ -111,6 +145,38 @@ def _segment_dist(pt, a, b):
     L2 = dx * dx + dy * dy
     t = 0.0 if L2 == 0 else max(0.0, min(1.0, ((pt[0] - a[0]) * dx + (pt[1] - a[1]) * dy) / L2))
     return math.hypot(pt[0] - a[0] - t * dx, pt[1] - a[1] - t * dy)
+
+
+_DIRS_CACHE = {}
+
+
+def _ring_dirs(yaw_rays, pitches):
+    """Unit directions of the all-round fan (computed once per setting, not every scan)."""
+    key = ("ring", yaw_rays, tuple(pitches))
+    if key not in _DIRS_CACHE:
+        out = []
+        for pd in pitches:
+            cp, sp = math.cos(math.radians(pd)), math.sin(math.radians(pd))
+            for k in range(yaw_rays):
+                yaw = 2 * math.pi * k / yaw_rays
+                out.append((cp * math.cos(yaw), cp * math.sin(yaw), sp))
+        _DIRS_CACHE[key] = out
+    return _DIRS_CACHE[key]
+
+
+def _fan_offsets(half_deg, step_deg, pitches):
+    """(cos yaw offset, sin yaw offset, cos pitch, sin pitch) of every forward-fan ray."""
+    key = ("fan", half_deg, step_deg, tuple(pitches))
+    if key not in _DIRS_CACHE:
+        n = int(round(half_deg / step_deg)) if step_deg > 0 else 0
+        out = []
+        for pd in pitches:
+            cp, sp = math.cos(math.radians(pd)), math.sin(math.radians(pd))
+            for k in range(-n, n + 1):
+                a = math.radians(k * step_deg)
+                out.append((math.cos(a), math.sin(a), cp, sp))
+        _DIRS_CACHE[key] = out
+    return _DIRS_CACHE[key]
 
 
 # ----------------------------------- Obstacle Map -----------------------------------
@@ -153,7 +219,11 @@ class ObstacleMap:
         return range(lo, hi + 1)
 
     # --- updates
-    def add_hit(self, pt):
+    def add_hit(self, pt, top=None):
+        """A sensed surface point, inflated by SAFETY_RADIUS. The obstacle is blocked from the hit
+        up to its top: `top` = the obstacle's known top height (m), e.g. from the map data. With
+        top=None (a surface not in the map) the top is unknown, so it is blocked all the way up
+        (PBI-12): open space above a hit is never assumed, the drone cannot "climb over" it."""
         c = self.to_cell(pt[0], pt[1])
         zb = int(math.floor(pt[2] / Z_BUCKET))
         if (c, zb) in self.seen:
@@ -161,9 +231,11 @@ class ObstacleMap:
         self.seen.add((c, zb))
         self.version += 1
         self.new_hits.append(pt)
+        ztop = UNKNOWN_TOP if top is None else max(top, pt[2])
+        column = range(zb, int(math.floor(ztop / Z_BUCKET)) + 1)
         for dx, dy in self.disc:
             cc = (c[0] + dx, c[1] + dy)
-            self.block.setdefault(cc, set()).add(zb)
+            self.block.setdefault(cc, set()).update(column)
         return True
 
     def add_keepout(self, pt, radius):
@@ -409,6 +481,8 @@ class Navigator:
         obstacles (env_sim.OBSTACLE_INFO). Optional: without it every hit is an unnamed obstacle."""
         self.drone, self.floor, self.target = drone_id, floor_id, target_id
         self.obstacle_info = obstacle_info if obstacle_info is not None else {}
+        self.sensor_mode = SENSOR_MODE   # "enhanced" or "baseline" (PBI-12 AC-03 comparison)
+        self.climbs = 0              # times the drone chose to climb over an obstacle (PBI-12 AC-04)
         self.detected = {}           # body id -> [sim time first sensed, closest sensed range (m)]
         self.sensed_clearance = float("inf")       # body-to-surface distance, latest scan
         self.min_sensed_clearance = float("inf")   # smallest value of the whole mission
@@ -450,19 +524,46 @@ class Navigator:
         self.log(f"[t={self.t:6.2f}s] {kind:<8} {msg}")
 
     # ------------------------------------------------------------- SENSE --
-    def sense(self):
-        px, py, pz = self.pos
+    def _baseline_rays(self, px, py, pz):
+        """The all-round fan exactly as before PBI-12 (directions recomputed every scan)."""
         froms, tos = [], []
         for pd in PITCHES_DEG:
             cp, sp = math.cos(math.radians(pd)), math.sin(math.radians(pd))
-            for k in range(YAW_RAYS):
-                yaw = 2 * math.pi * k / YAW_RAYS
+            for k in range(BASELINE_YAW_RAYS):
+                yaw = 2 * math.pi * k / BASELINE_YAW_RAYS
                 d = (cp * math.cos(yaw), cp * math.sin(yaw), sp)
                 froms.append([px + d[0] * SENSOR_START, py + d[1] * SENSOR_START, pz + d[2] * SENSOR_START])
                 tos.append([px + d[0] * SENSOR_RANGE, py + d[1] * SENSOR_RANGE, pz + d[2] * SENSOR_RANGE])
+        return froms, tos
+
+    def _enhanced_rays(self, px, py, pz, h):
+        """PBI-12: the all-round fan (unit directions computed once) + the dense forward fan."""
+        a, b = SENSOR_START, SENSOR_RANGE
+        froms = [[px + dx * a, py + dy * a, pz + dz * a] for dx, dy, dz in _ring_dirs(YAW_RAYS, PITCHES_DEG)]
+        tos = [[px + dx * b, py + dy * b, pz + dz * b] for dx, dy, dz in _ring_dirs(YAW_RAYS, PITCHES_DEG)]
+        if h is not None:
+            for c, s_, cp, sp in _fan_offsets(FWD_FAN_HALF_DEG, FWD_FAN_STEP_DEG, FWD_FAN_PITCHES_DEG):
+                dx, dy = (h[0] * c - h[1] * s_) * cp, (h[0] * s_ + h[1] * c) * cp
+                froms.append([px + dx * a, py + dy * a, pz + sp * a])
+                tos.append([px + dx * b, py + dy * b, pz + sp * b])
+        return froms, tos
+
+    def ray_count(self):
+        """Rays in one scan while flying (all-round + forward fan + corridor)."""
+        if self.sensor_mode == "baseline":
+            return BASELINE_YAW_RAYS * len(PITCHES_DEG) + len(CORRIDOR_OFFSETS)
+        return (YAW_RAYS * len(PITCHES_DEG) + len(CORRIDOR_OFFSETS)
+                + len(_fan_offsets(FWD_FAN_HALF_DEG, FWD_FAN_STEP_DEG, FWD_FAN_PITCHES_DEG)))
+
+    def sense(self):
+        px, py, pz = self.pos
+        h = self._heading()
+        if self.sensor_mode == "baseline":
+            froms, tos = self._baseline_rays(px, py, pz)
+        else:
+            froms, tos = self._enhanced_rays(px, py, pz, h)
 
         # forward corridor along the current direction of travel
-        h = self._heading()
         n_scan = len(froms)
         if h is not None:
             perp = (-h[1], h[0])
@@ -471,19 +572,41 @@ class Navigator:
                 froms.append([ox + h[0] * SENSOR_START, oy + h[1] * SENSOR_START, pz])
                 tos.append([ox + h[0] * CORRIDOR_RANGE, oy + h[1] * CORRIDOR_RANGE, pz])
 
-        results = p.rayTestBatch(froms, tos)
+        results = list(p.rayTestBatch(froms, tos))
+        # PBI-12 AC-02: the casualty is see-through for the range sensor. A ray that hits the target
+        # is cast again from just beyond it, so the target can never hide an obstacle behind it
+        # (e.g. the trunk of the tree it lies under). Only those few rays are re-cast.
+        if self.target is not None and self.target >= 0:
+            for _ in range(2):
+                again = [i for i, r in enumerate(results) if r[0] == self.target]
+                if not again:
+                    break
+                if not self.target_seen:
+                    hx, hy = results[again[0]][3][0], results[again[0]][3][1]
+                    self.target_seen = True
+                    self.event("TARGET", f"casualty sighted near ({hx:.1f}, {hy:.1f})")
+                starts = []
+                for i in again:
+                    f, t, hit = froms[i], tos[i], results[i][3]
+                    L = math.dist(f, t) or 1.0
+                    starts.append([hit[k] + (t[k] - f[k]) / L * 0.02 for k in range(3)])
+                for i, r in zip(again, p.rayTestBatch(starts, [tos[i] for i in again])):
+                    results[i] = r
         self.clear_ahead = float("inf")
         self.ahead_hit = None                     # the corridor hit that sets clear_ahead
         nearest, nearest_uid, close_hits = float("inf"), None, []
         for i, (uid, _link, _frac, hit, _n) in enumerate(results):
             if uid < 0 or uid == self.drone or uid == self.floor:
                 continue
-            if uid == self.target:                    # the casualty is not an obstacle
+            # AC-02: Target is completely skipped and NEVER registers as an obstacle map hit.
+            if uid == self.target:
                 if not self.target_seen:
                     self.target_seen = True
                     self.event("TARGET", f"casualty sighted near ({hit[0]:.1f}, {hit[1]:.1f})")
                 continue
-            self.map.add_hit(hit)
+            
+            ob = self.obstacle_info.get(uid)          # known top from the map data, else unknown
+            self.map.add_hit(hit, top=ob.height if ob is not None else None)
             rng = math.dist(hit, self.pos)            # sensor range to this surface point
             self._identify(uid, hit, rng)
             if rng < nearest:
@@ -588,11 +711,35 @@ class Navigator:
 
 
     # ----------------------------------------------------------- RESPOND --
+    def _flight_levels(self, start):
+        """Altitudes replan() may use: the current one, then (PBI-12 AC-04) the cruise altitude and
+        the levels CLIMB_STEP apart up to MAX_ALT. A level is only usable if the drone can climb or
+        descend to it on the spot: the column above / below it must be free."""
+        if not CLIMB_OVER:
+            return [self.alt]
+        levels, a = [], self.cruise
+        while a <= MAX_ALT + 1e-6:
+            levels.append(round(a, 3))
+            a += FLIGHT_LEVEL_STEP
+        usable = [self.alt]
+        for direction in (1, -1):                # going up, then going down from the current level
+            for a in sorted((x for x in levels if (x - self.alt) * direction > 1e-6),
+                            key=lambda x: abs(x - self.alt)):
+                if self.map.blocked(start[0], start[1], a):
+                    break                        # something above / below: cannot get past it
+                usable.append(a)
+        return usable
+
     def _replan(self):
         """
-        Plan a detour to the first reachable remaining waypoint at the current altitude.
-        Tries the remaining waypoints in order and uses A* to find an obstacle-free path to each.
-        Waypoints that can't be reached are skipped. In RTL mode the only goal is the launch point.
+        Plan a route to the first reachable remaining waypoint.
+        Tries the remaining waypoints in order. For each, A* looks for an obstacle-free path at
+        every usable flight level (_flight_levels) and the cheapest option is taken:
+            cost = level path length + VERT_COST x (climb or descent now + descent back to cruise)
+        A change of altitude must save at least CLIMB_MIN_SAVING_M / CLIMB_MIN_SAVING_FRAC over
+        staying at the current altitude (PBI-12 AC-04: climb over a low obstacle only when that
+        is clearly shorter, otherwise go round it). Waypoints that can't be reached at any level
+        are skipped. In RTL mode the only goal is the launch point.
         Returns True if a new route was set, False if no remaining waypoint is reachable
         (on_blocked() then escalates to climbing or return-to-launch).
         """
@@ -606,27 +753,48 @@ class Navigator:
             escape = self.map.nearest_free(start, self.alt, max_r=ESCAPE_RADIUS)
             if escape is not None:
                 start = escape
+
         # Route entries are (x, y, waypoint index). Detour points have index None, so this
-        # keeps only the real waypoints still ahead of the drone.        
+        # keeps only the real waypoints still ahead of the drone.
         remaining = [r[2] for r in self.route if r[2] is not None]
-        # When returning to launch, the launch point (index -1) is the only goal.        
+        # When returning to launch, the launch point (index -1) is the only goal.
         if self.state == "RTL":
             remaining = [-1]
+        levels = self._flight_levels(start)
+
         for j in remaining:
             goal = self.wps[j] if j >= 0 else (DRONE_START_POS[0], DRONE_START_POS[1])
-            # If the waypoint falls inside an obstacle's safety margin, move it to the
-            # nearest free cell; A* can't plan into a blocked goal.
-            snapped = self.map.nearest_free(goal, self.alt)
-            if snapped is None:
-                continue
-            # Run A* from the drone's position. No path means try the next waypoint instead.
-            path = self.map.astar(start, snapped, self.alt)
-            if path is None:
-                continue
+            options = []                          # (cost, altitude, path, snapped goal, length)
+            for alt in levels:
+                # If the waypoint falls inside an obstacle's safety margin, move it to the
+                # nearest free cell; A* can't plan into a blocked goal.
+                snapped = self.map.nearest_free(goal, alt)
+                if snapped is None:
+                    continue
+                path = self.map.astar(start, snapped, alt)
+                if path is None:
+                    continue
+                pts = [start] + path
+                length = sum(math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
+                             for i in range(1, len(pts)))
+                climb = max(0.0, alt - self.alt)
+                descend = max(0.0, self.alt - alt) + max(0.0, alt - self.cruise)  # now + back later
+                options.append((length + CLIMB_COST * climb + DESCEND_COST * descend,
+                                alt, path, snapped, length))
+            if not options:
+                continue                          # no path at any level: try the next waypoint
+            best = min(options, key=lambda o: o[0])
+            stay = next((o for o in options if abs(o[1] - self.alt) < 1e-6), None)
+            if stay is not None and best is not stay:
+                saving = stay[0] - best[0]
+                if saving < max(CLIMB_MIN_SAVING_M, CLIMB_MIN_SAVING_FRAC * stay[0]):
+                    best = stay                   # not worth changing altitude
+            cost, alt, path, snapped, length = best
+
             if snapped != goal:
                 self.event("REPLAN", f"waypoint {j} sits inside an obstacle margin; moved to "
                                      f"({snapped[0]:.1f}, {snapped[1]:.1f})")
-                        # Waypoints still in the route before j had no path: name each one (PBI-04 AC-02).
+            # Waypoints still in the route before j had no path: name each one (PBI-04 AC-02).
             if j >= 0:
                 for s in remaining[:remaining.index(j)]:
                     sx, sy = self.wps[s]
@@ -635,7 +803,7 @@ class Navigator:
                                           f"alt {self.alt:.1f} m - skipped; heading to waypoint {j}")
 
             # Build the new route: A* detour points (index None), then the reached waypoint
-            # tagged with its index, then every later waypoint unchanged.            
+            # tagged with its index, then every later waypoint unchanged.
             route = [(escape[0], escape[1], None)] if escape is not None else []
             route += [(x, y, None) for (x, y) in path[:-1]]
             route.append((path[-1][0], path[-1][1], j if j >= 0 else None))
@@ -647,15 +815,24 @@ class Navigator:
             if escape is not None:
                 self.event("REPLAN", f"inside a safety margin; backing away to "
                                      f"({escape[0]:.1f}, {escape[1]:.1f}) first")
+            if alt > self.alt + 1e-6:
+                level = min((o for o in options if abs(o[1] - self.alt) < 1e-6), default=None,
+                            key=lambda o: o[0])
+                why = (f"saves ~{level[0] - cost:.1f} m over the detour" if level is not None
+                       else "no detour at this altitude")
+                self.alt = alt
+                self.state = "CLIMB"
+                self.climbs += 1
+                self.event("CLIMB", f"climbing to {alt:.1f} m to fly over the obstacle ({why})")
+            elif alt < self.alt - 1e-6:
+                self.alt = alt
+                self.event("DESCEND", f"descending to {alt:.1f} m for this route")
             # Log the detour length for the event history.
-            pts = [start] + path
-            length = sum(math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
-                         for i in range(1, len(pts)))
             self.event("REPLAN", f"detour found: {len(path)} legs, ~{length:.1f} m to waypoint {j} "
                                  f"at alt {self.alt:.1f} m")
             self.draw_route()
             return True
-        # Every remaining waypoint was unreachable at this altitude.        
+        # Every remaining waypoint was unreachable at every usable altitude.
         return False
 
     def on_blocked(self, reason, emergency=False):

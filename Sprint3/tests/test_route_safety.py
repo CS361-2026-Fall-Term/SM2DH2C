@@ -3,7 +3,7 @@ Contributors: Mylan Bui
 PBI-04 tests: obstacle-safe A* routes in generated environments.
 No running simulator needed (sensor hits are added to the obstacle map directly), but
 object_avoidance.py imports PyBullet, so these are skipped if it isn't installed.
-Run from Sprint3/:  python -m unittest discover tests -v
+Run from the Sprint folder:  python -m unittest tests.test_route_safety -v
 Full 20-seed check of the ACs (with physics): python route_safety_runs.py
 
 Covers
@@ -14,8 +14,14 @@ Covers
   AC-04  the same seed gives the same layout; the same map gives the same route
 """
 import math
+import os
+import sys
 import time
 import unittest
+
+CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # the Sprint folder
+if CODE_DIR not in sys.path:
+    sys.path.insert(0, CODE_DIR)
 
 try:
     import env_sim
@@ -29,22 +35,23 @@ ALT = 2.5                               # cruise altitude used by FLIGHT_PATH
 REPLAN_LIMIT_MS = 50.0
 
 
-def add_wall_line(m, x, y0, y1, z=ALT, step=0.1, gap=None):
-    """Sensor hits along the line x = const from y0 to y1, leaving out |y - gap[0]| < gap[1]."""
+def add_wall_line(m, x, y0, y1, z=ALT, step=0.1, gap=None, top=None):
+    """Sensor hits along the line x = const from y0 to y1, leaving out |y - gap[0]| < gap[1].
+    top: known top of the wall (None = unknown, blocked all the way up; PBI-12)."""
     y = y0
     while y <= y1 + 1e-9:
         if gap is None or abs(y - gap[0]) >= gap[1]:
-            m.add_hit((x, y, z))
+            m.add_hit((x, y, z), top=top)
         y += step
 
 
-def add_pen(m, cx, cy, half=1.5, z=ALT, step=0.1):
+def add_pen(m, cx, cy, half=1.5, z=ALT, step=0.1, top=None):
     """Sensor hits on all 4 sides of a square pen around (cx, cy), like generate_layout's walls."""
     k = int(round(2 * half / step))
     for i in range(k + 1):
         t = -half + i * step
         for pt in ((cx + t, cy + half), (cx + t, cy - half), (cx + half, cy + t), (cx - half, cy + t)):
-            m.add_hit((pt[0], pt[1], z))
+            m.add_hit((pt[0], pt[1], z), top=top)
 
 
 @unittest.skipUnless(HAVE_SIM, "PyBullet not installed")
@@ -152,10 +159,16 @@ class TestAStar(unittest.TestCase):
         self.assertIsNotNone(m.astar((-5.0, 5.0), (8.0, -8.0), ALT))
 
     def test_pen_only_blocks_at_its_height(self):
-        # Hits are at 2.5 m; well above them the same goal is reachable again.
+        # A pen whose top is known (3 m): well above it the same goal is reachable again.
+        m = ObstacleMap()
+        add_pen(m, 5.0, 5.0, top=3.0)
+        self.assertIsNotNone(m.astar((-10.0, -10.0), (5.0, 5.0), oa.MAX_ALT))
+
+    def test_pen_of_unknown_height_blocks_every_altitude(self):
+        # PBI-12: hits on something whose top is unknown never leave open space above them.
         m = ObstacleMap()
         add_pen(m, 5.0, 5.0)
-        self.assertIsNotNone(m.astar((-10.0, -10.0), (5.0, 5.0), oa.MAX_ALT))
+        self.assertIsNone(m.astar((-10.0, -10.0), (5.0, 5.0), oa.MAX_ALT))
 
     def test_same_map_same_route(self):                                    # AC-04
         a = self.gap_map().astar((-5.0, 5.0), (5.0, -5.0), ALT)

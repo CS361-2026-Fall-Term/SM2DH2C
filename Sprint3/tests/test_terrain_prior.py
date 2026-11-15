@@ -1,7 +1,7 @@
 """
 Contributors: Sofia Monge and Mylan Bui
 File Description: Unit tests for terrain_prior.py (PBI-03 Steps 1-3).
-Run from the folder holding terrain_prior.py and tests/:  python -m unittest discover tests -v
+Run from the Sprint folder:  python -m unittest discover -s tests -v
 """
 import math
 import os
@@ -11,7 +11,9 @@ from types import SimpleNamespace
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # the Sprint folder
+if CODE_DIR not in sys.path:
+    sys.path.insert(0, CODE_DIR)
 import terrain_prior as tp  # noqa: E402
 
 

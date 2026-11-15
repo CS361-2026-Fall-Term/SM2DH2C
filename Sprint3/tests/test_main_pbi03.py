@@ -4,14 +4,16 @@ File Description: Integration tests for PBI-03 in main.py: the initial map is bu
 terrain, zones excluded in the setup window are applied at START, and operator commands update the
 probability map. Uses the real Mission and ProbabilityMap; navigation is replaced by a stub, so no
 PyBullet window is opened.
-Run from the folder holding main.py and tests/:  python -m unittest discover tests -v
+Run from the Sprint folder:  python -m unittest discover -s tests -v
 """
 import os
 import sys
 import unittest
 from types import SimpleNamespace
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # the Sprint folder
+if CODE_DIR not in sys.path:
+    sys.path.insert(0, CODE_DIR)
 try:
     import main
     import sim_config
