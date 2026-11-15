@@ -42,7 +42,7 @@ import terrain_prior
 import map_search
 from env_sim import build_world, FLIGHT_PATH, DRONE_START_POS, OBSTACLE_POSITIONS
 from object_avoidance import Navigator, DT, V_MAX
-from target_detection import MissingPerson, SearchMonitor
+from target_detection import MissingPerson, SearchMonitor, explain_method, LOG_MODES
 from operator_guidance import Mission, Cmd, ZONES, ZONE_COMMANDS, scale_zones
 from map_search import MapGuidedSearch, SightingConfirm
 from probability_map import ProbabilityMap
@@ -451,6 +451,10 @@ def main():
                              "default); fixed = always A -> B -> C -> D")
     parser.add_argument("--exclude-zones", default=None,
                         help="zones not to search, set before the mission, e.g. AC")
+    parser.add_argument("--detection-log", choices=LOG_MODES, default="scans",
+                        help="detection results in the terminal (PBI-13): 'scans' = a line per camera "
+                             "scan with the confidence while the person is in view (default), "
+                             "'events' = only sightings and the result, 'off' = nothing")
     parser.add_argument("--resume", action="store_true",
                         help="continue the last saved mission (state, plan, history, drone position, "
                              "probability map) instead of starting a new one")
@@ -621,7 +625,9 @@ def main():
     # PBI-10: every save carries the starting information, so --resume rebuilds this same search.
     store.set_context(setup=setup_from_args(args, person_xy), zones=ZONES)
     # label_dz lifts the detection label above the Navigator's label so they don't overprint.
-    monitor = SearchMonitor(person, gui=gui, label_dz=1.4)
+    monitor = SearchMonitor(person, gui=gui, label_dz=1.4, log_mode=args.detection_log)
+    if args.detection_log != "off":
+        print(explain_method())                         # PBI-13: what the numbers mean
 
     if person_xy is not None and not (x_range[0] <= person_xy[0] <= x_range[1]
                                       and y_range[0] <= person_xy[1] <= y_range[1]):
@@ -635,6 +641,9 @@ def main():
         p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
 
     mission = Mission()
+    # PBI-13: detection events (possible sighting, lost, FOUND with the estimated location) go to
+    # the mission history, so they appear in the operator panel's message log.
+    monitor.on_event = lambda kind, text: mission.record(f"DETECT {kind}", text)
     if args.zone_order == "map" and resumed is None:   # a resumed mission keeps its saved order
         order, mass = zones_by_probability(belief)
         print("Zone order by probability: " + " -> ".join(f"{z} ({mass[z]:.0%})" for z in order))
@@ -1015,6 +1024,8 @@ def main():
                   f"{sum(1 for r in searcher.log_rows if r[3])}/{len(searcher.log_rows)} looks "
                   "had the target cell in the camera view")
         print("Detection:", monitor.report())
+        if args.detection_log != "off":
+            print(monitor.format_report())             # PBI-13: readable detection summary
         closest = ("nothing sensed" if nav.min_sensed_clearance == float("inf")
                    else f"{nav.min_sensed_clearance:.2f} m")
         print(f"Obstacles: {len(nav.detected)} of {len(obstacle_ids)} generated obstacles detected | "

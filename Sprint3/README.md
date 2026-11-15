@@ -16,3 +16,10 @@ PBI-12 (range sensor and climb-or-detour), results in `tests/RANGE_SENSOR_TEST_R
 python -m unittest tests.test_range_sensor -v      # AC-01..AC-04
 python range_sensor_runs.py                        # re-runs the scenarios and rewrites the report
 ```
+
+PBI-13 (detection results with the confidence level in the terminal), see `tests/DETECTION_RESULTS_REPORT.md`:
+```
+python main.py --detection-log scans     # default: a line per camera scan while the person is in view
+python main.py --detection-log events    # only sightings and the result
+python -m unittest tests.test_detection_results -v
+```
