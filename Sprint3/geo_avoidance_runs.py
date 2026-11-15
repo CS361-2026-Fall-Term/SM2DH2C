@@ -7,7 +7,7 @@ distances between the drone's collision body and every obstacle), not against wh
 reported:
 
   AC-01  the map's key objects (buildings, single trees, trees scattered in woods) are placed as
-         URDF bodies at their real positions (placement error < 5 cm) with no problems reported
+         solid bodies at their real positions (placement error < 5 cm) with no problems reported
   AC-02  every obstacle standing on the route is detected and named, the drone re-plans around it,
          reaches every waypoint, never touches anything and never comes inside UNSAFE_DIST (0.35 m).
          "popup" scenario: an obstacle appears INSIDE the unsafe distance mid-flight; the sensor
@@ -32,7 +32,6 @@ import copy
 import csv
 import math
 import os
-import tempfile
 import time
 
 import pybullet as p
@@ -130,7 +129,7 @@ def spawn_popup(nav, ids):
     ob = geo_obstacles.Obstacle("building", 'building "Pop-up Kiosk"', 0.0, 0.0, 0.0, height=6.0,
                                 radius=math.sqrt(2), cx=cx, cy=cy, footprint=corners, source="map",
                                 meta={"index": 999})
-    new_ids, table, problems = geo_obstacles.spawn(p, [ob], out_dir=tempfile.mkdtemp(prefix="popup_"))
+    new_ids, table, problems = geo_obstacles.spawn(p, [ob])
     ids.update(new_ids)
     nav.obstacle_info.update(table)
     nav.event("WORLD", f"(test) {ob.name} appeared {POPUP_GAP:.2f} m from the drone")

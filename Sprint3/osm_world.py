@@ -860,8 +860,8 @@ def _mesh_bodies(p, builder, rgb, alpha=1.0):
 
 def building_mesh(poly, h):
     """Solid extruded footprint as (vertices, triangle indices), or None if the outline cannot be
-    triangulated. This is the shape the LIDAR and A* see; geo_obstacles.py writes it to an .obj
-    file for the building's URDF. No PyBullet needed."""
+    triangulated. This is the shape the LIDAR and A* see; geo_obstacles.py uses it for the
+    building's collision mesh. No PyBullet needed."""
     tris = triangulate(poly)
     if not tris:
         return None
@@ -902,7 +902,7 @@ def _bridge_segments(scene):
 
 def _build_simple(p, scene, solids=True):
     """The original flat-colour look (also the fallback if anything in the detailed look fails).
-    solids=False: buildings are skipped here (their URDF bodies already have this look)."""
+    solids=False: buildings are skipped here (their solid bodies already have this look)."""
     solid_ids = []
     for poly, h, *_ in (scene.buildings if solids else []):
         col, mesh = _building_collision(p, poly, h)
@@ -1354,7 +1354,7 @@ def _detailed_buildings(p, va, scene, solid_ids, solids=True):
     """Same solid collision mesh per building as before (what the LIDAR and A* see), drawn with
     textured walls, real roof shapes, parapets, rooftop units, and building:part massing.
     solids=False: only the visuals are made here; the solid body of each building was already
-    loaded from its URDF file (geo_obstacles.spawn)."""
+    built by geo_obstacles.spawn."""
     s = scene.scale
     # building:part pieces belong to the building that contains their centre
     parts_of = {}
@@ -1425,7 +1425,7 @@ def build_bodies(scene, detailed=True, avoid=(), solids=True):
     Collision shapes are identical in both modes, so sensing and navigation do not change.
 
     solids=False: draw only. env_sim.build_world uses this because the solid building bodies are
-    loaded from generated URDF files (geo_obstacles.spawn); the returned list is then empty."""
+    built by geo_obstacles.spawn; the returned list is then empty."""
     import pybullet as p
     if detailed:
         try:

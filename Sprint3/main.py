@@ -134,7 +134,7 @@ def search_bounds(margins = 3.0):
     pts = [DRONE_START_POS] + list(OBSTACLE_POSITIONS) + list(FLIGHT_PATH)
     reach = max(max(abs(pt[0]), abs(pt[1])) for pt in pts) + margins
     # Clamped to the map, so OSM trees near the edge never grow the search area past it.
-    h = min(reach, sim_config.MAP_HALF)
+    h = float(min(reach, sim_config.MAP_HALF))   # plain float: numpy 2 prints np.float64(...)
     return ((-h, h), (-h, h))
 
 

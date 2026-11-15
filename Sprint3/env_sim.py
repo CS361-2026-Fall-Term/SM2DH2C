@@ -212,13 +212,13 @@ def build_world(gui=True, assets=None):
     # Navigator moves the drone kinematically. Prevent gravity/contacts from moving it a second time between position updates.
     p.changeDynamics(drone_id, -1, mass=0)
 
-    # Obstacles (trees, tall walls, map buildings). Each one is described by an Obstacle record,
-    # written to a URDF file in generated_obstacles/ and loaded at its real position. The URDF
-    # collision shape is what the LIDAR and camera rays hit; it is the same in every visual mode.
+    # Obstacles (trees, tall walls, map buildings). Each one is described by an Obstacle record and
+    # built directly in PyBullet at its real position. Its collision shape is what the LIDAR and
+    # camera rays hit; it is the same in every visual mode.
     obstacles, problems = geo_obstacles.obstacles_from_world(OBSTACLE_POSITIONS, TREE_KINDS, WALLS,
                                                              OSM_SCENE)
-    # Detailed look: the URDFs carry no visual, the tree models / textured buildings are drawn as
-    # separate visual-only bodies below. Simple look: the URDF's own flat-colour shapes are shown.
+    # Detailed look: the obstacle bodies are invisible, the tree models / textured buildings are
+    # drawn as separate visual-only bodies below. Simple look: their own flat-colour shapes are shown.
     detailed = DETAILED_VISUALS
     obstacle_ids, table, spawn_problems = geo_obstacles.spawn(p, obstacles, visual=not detailed)
     OBSTACLE_INFO.clear()
@@ -230,7 +230,7 @@ def build_world(gui=True, assets=None):
                 _draw_tree(ob)
 
     # Map roads/water/ground (visual only) and, in the detailed look, the building visuals. The
-    # solid building bodies were loaded from their URDF files above (solids=False).
+    # solid building bodies were already built above (solids=False).
     if OSM_SCENE is not None:
         try:
             osm_world.build_bodies(OSM_SCENE, detailed=detailed, avoid=[tuple(TARGET_POSITION[:2])],
@@ -252,7 +252,7 @@ def build_world(gui=True, assets=None):
 
 def _draw_tree(ob):
     """Detailed look of one tree: trunk + low-poly canopy as visual-only bodies on top of the
-    tree's (invisible) URDF collision body. Falls back to the plain cylinder + sphere."""
+    tree's (invisible) collision body. Falls back to the plain cylinder + sphere."""
     k = ob.meta.get("index", 0)
     tv, lv = _tree_visuals(ob.meta.get("tree_kind", "deciduous"), k)
     if tv is None:

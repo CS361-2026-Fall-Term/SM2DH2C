@@ -16,8 +16,8 @@ File Description:
     After clearing an obstacle the drone steps back down to its cruise altitude.
 
 Obstacles generated from the operator's geographical input (geo_obstacles.py):
-    The world's solid obstacles (map buildings, trees, walls) are loaded from generated URDF
-    files, and the Navigator is given the table {PyBullet body id: Obstacle}. The sensor uses it:
+    The world's solid obstacles (map buildings, trees, walls) are built from Obstacle
+    records (geo_obstacles.spawn), and the Navigator is given the table {PyBullet body id: Obstacle}. The sensor uses it:
     - Identify: the first ray that hits an object logs DETECT with its name, height and range.
     - Recognise: a building or wall is a vertical-sided object with a known outline and height.
       Once the sensor has seen any part of it, its whole outline is put in the obstacle map, so
@@ -855,7 +855,7 @@ def build_world(gui, assets):
                           p.getQuaternionFromEuler([0, 0, 0]), globalScaling=DRONE_SCALE)
 
     # Obstacles go through the same pipeline as the integrated simulation: Obstacle records ->
-    # generated URDF files -> PyBullet bodies, with a table saying what each body is.
+    # PyBullet bodies, with a table saying what each body is.
     obstacles, problems = geo_obstacles.obstacles_from_world(OBSTACLE_POSITIONS)
     obstacle_ids, obstacle_info, more = geo_obstacles.spawn(p, obstacles)
     for line in geo_obstacles.format_problems(problems + more):

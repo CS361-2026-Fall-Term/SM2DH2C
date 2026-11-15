@@ -12,9 +12,9 @@ data (an `.osm` export, an Overpass `.json` file, or a download around the last 
 only on the hand-placed trees.
 
 - `geo_obstacles.py` reads and checks the map data, turns its key objects (buildings, single trees,
-  trees scattered in woods) into one URDF file each (buildings also get an `.obj` mesh), and loads
-  them at their real positions. Files go to `generated_obstacles/` (rewritten every run, git-ignored)
-  with a `manifest.json` listing what was placed where.
+  trees scattered in woods) into obstacle records, and builds each one directly in PyBullet at its
+  real position (trees as trunk + canopy, buildings as their footprint extruded to their height).
+  No files are written.
 - `object_avoidance.py`: the range sensor names the object it hits (`DETECT building "Kerr Library"
   ...`), puts a mapped building's whole outline into the obstacle map on first sight, and reacts to
   anything closer than `UNSAFE_DIST` (0.35 m) with `UNSAFE`, backing away and re-planning.
@@ -22,14 +22,15 @@ only on the hand-placed trees.
   `ERROR:` message; a single bad map object is skipped, named in the console and counted on the
   operator panel, and everything else is still placed.
 
-Convert a map file without starting the simulation:
+Check a map file and list the obstacles it gives, without starting the simulation:
 ```
-python geo_obstacles.py map.osm --lat 44.6488 --lon -123.3123 --area 200 --out my_obstacles
+python geo_obstacles.py map.osm --lat 44.6488 --lon -123.3123 --area 200 --list
 ```
 
 Tests (run from `Sprint2/`):
 ```
-python -m unittest tests.test_geo_obstacles -v     # 23 tests, AC-01..AC-03 (about 5 s)
+python -m unittest tests.test_geo_obstacles -v     # PBI-15: 26 tests, AC-01..AC-03 (a few seconds)
+python -m unittest discover -s tests -v            # every test in tests/ (PBI-06, PBI-10, PBI-15)
 python geo_avoidance_runs.py                       # flights with ground-truth clearances -> geo_avoidance_results/
 ```
 `tests/fixtures/geo_test_area.json` is a small map with buildings and trees at predefined positions on
