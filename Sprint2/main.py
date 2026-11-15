@@ -40,8 +40,6 @@ import sim_config
 import terrain_prior
 import map_search
 from env_sim import build_world, FLIGHT_PATH, DRONE_START_POS, OBSTACLE_POSITIONS
-import object_avoidance
-import range_sensor
 from object_avoidance import Navigator, DT, V_MAX
 from target_detection import MissingPerson, SearchMonitor
 from operator_guidance import Mission, Cmd, ZONES, ZONE_COMMANDS, scale_zones
@@ -457,11 +455,7 @@ def main():
                              "probability map) instead of starting a new one")
     parser.add_argument("--state-file", default=DEFAULT_PATH,
                         help="where the mission state is saved (default: mission_state.json here)")
-    parser.add_argument("--sensor", choices=sorted(range_sensor.LAYOUTS), default=object_avoidance.SENSOR_LAYOUT,
-                        help="range sensor ray layout: enhanced (default) or baseline (the original "
-                             "fixed fan, for comparison)")
     args = parser.parse_args()
-    object_avoidance.SENSOR_LAYOUT = args.sensor     # the Navigator reads this when it is built
     try:
         args.person_category, person_xy = parse_person(args.person)
     except ValueError as exc:

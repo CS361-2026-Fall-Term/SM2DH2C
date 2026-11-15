@@ -1,10 +1,8 @@
 """
 Contributor: Chase Vanderlip Mylan Bui (A* Integration)
 File Description: 
-1.Sense: simulated range sensor that uses pybullet ray casts and scans around the drone every
-          few physics steps. The ray layout lives in range_sensor.py: "enhanced" (default; rotating
-          360 deg ring + forward fovea + push-broom + umbrella) or "baseline" (the original fixed
-          360 deg x 3 pitch-layer fan, kept for A/B testing). Hits on the casualty are never mapped.
+1.Sense: simulated range sensor that uses pybullet ray casts, 
+360 degree x 3 pitch layers and scans around the drone every few physics steps
 2.Detect: These hits are stored in persistant obstacle map (2.5D: x, y + Height).
           The route is declared Blocked when:
             - the upcoming part of the planned route crosses an (inflated) obstacle, or
@@ -12,8 +10,7 @@ File Description:
 3.Response: in order of preference
     a) slow down / hover, then re-plan a detour (A* on the map) to the next waypoint
     b) if a waypoint is unreachable, skip to the next reachable waypoint
-    c) if no horizontal detour exists, climb in steps and try again (never into an obstacle
-       the sensor has seen overhead)
+    c) if no horizontal detour exists, climb in steps and try again
     d) if still blocked, return to launch (RTL)
     e) if RTL is blocked too, hover and report "awaiting operator"
     After clearing an obstacle the drone steps back down to its cruise altitude.
@@ -26,7 +23,6 @@ import sys
 import time
 import pybullet as p
 import pybullet_data
-import range_sensor
 import sim_config
 from env_sim import DRONE_START_POS, DRONE_SCALE, OBSTACLE_POSITIONS, TARGET_POSITION, FLIGHT_PATH
 
@@ -38,14 +34,16 @@ V_MAX = 2.0                    # m/s cruise speed.
 V_MIN = 0.3                    # m/s creep speed when something is ahead.
 V_Z = 1.0                      # m/s vertical speed.
 
-# Range sensor ray layout (range_sensor.py): "enhanced" (default) or "baseline" (original fan).
-# Ray counts, ranges and angles are set in range_sensor.py.
-SENSOR_LAYOUT = "enhanced"
-# Forward hits inside this tube around the flight line give the distance to whatever is in the way
-# and drive slow-down / hard stop (enhanced layout; the baseline uses its 3 corridor rays only).
-CORRIDOR_HALF_WIDTH = 0.45     # m either side of the flight line (corridor rays sit at +-0.4 m)
-CORRIDOR_HALF_HEIGHT = 0.35    # m above/below the flight altitude (propeller reach, UNSAFE_DIST)
-TARGET_RECAST = 6              # enhanced: max re-casts per ray when looking through the casualty
+# Range sensor: a fan of rays around the drone, in 3 pitch layers (up/level/down).
+SENSOR_RANGE = 5.0
+SENSOR_START = 0.30            # Rays start outside the drone's own body.
+YAW_RAYS = 72                  # 5 deg resolution.
+PITCHES_DEG = (-25.0, 0.0, 25.0)
+
+# Forward corridor: extra rays straight along the direction of travel. Gives the
+# distance to whatever is directlly in the waym and drives slow-down.
+CORRIDOR_RANGE = 3.0           # Forward rays along the direction of travel.
+CORRIDOR_OFFSETS = (-0.4, 0.0, 0.4)
 SLOW_DIST = 3.0                # Start slowing down inside this distance.
 STOP_DIST = 0.9                # Hard stop / re-plan inside this distance.
 LOOKAHEAD = 4.0                # How far along the route we check for blockage.
@@ -67,7 +65,6 @@ GOAL_PROBE_CELLS = 2000        # PBI-04 AC-03: max cells the "is the goal walled
 CLIMB_STEP = 1.0               # Metres gained per climb attempt.
 MAX_ALT = 5.5                  # Climb threshold, don't go over this.
 REPLAN_COOLDOWN = 0.5          # s between sensor-triggered re-plans (hard stops ignore this).
-CLIMB_CHECK = True             # don't climb into an obstacle the sensor has seen overhead (False = old behaviour)
 
 # GUI obstacle-hit marks (drawing only, no effect on navigation).
 SHOW_HIT_MARKS = True          # False = don't draw LIDAR hits at all.
@@ -215,8 +212,6 @@ class ObstacleMap:
         s, g = self.to_cell(*start_xy), self.to_cell(*goal_xy)
         if not self.in_bounds(s) or not self.in_bounds(g) or self.blocked_cell(g, alt):
             return None
-        if s == g:                                 # already there (e.g. return-to-launch from launch)
-            return [goal_xy]
         n = self.n
         si, gi = s[0] * n + s[1], g[0] * n + g[1]
         # A failed search already explored everything reachable from this start. If nothing new
@@ -304,10 +299,8 @@ class ObstacleMap:
 class Navigator:
     """Sense -> detect blocked route -> respond. Owns the drone's motion."""
 
-    def __init__(self, drone_id, floor_id, target_id, waypoints, gui, log, sensor=None):
-        """sensor: range_sensor layout name ("enhanced" / "baseline"); None = SENSOR_LAYOUT."""
+    def __init__(self, drone_id, floor_id, target_id, waypoints, gui, log):
         self.drone, self.floor, self.target = drone_id, floor_id, target_id
-        self.sensor = range_sensor.make_layout(sensor or SENSOR_LAYOUT)
         self.gui, self.log = gui, log
         self.pos = list(DRONE_START_POS)
         self.wps = [(w[0], w[1]) for w in waypoints]
@@ -328,9 +321,6 @@ class Navigator:
         self.emergency_stops = 0
         self.last_replan_t = -99.0
         self.target_seen = False
-        self.target_hits = 0         # rays that hit the casualty (never added to the obstacle map)
-        self._target_sum = [0.0, 0.0, 0.0]
-        self.target_estimate = None  # mean of all casualty hit points (x, y, z)
         self._debug_ids = []
         self._text_id = None
         self._last_draw = -1.0
@@ -345,91 +335,44 @@ class Navigator:
 
     # ------------------------------------------------------------- SENSE --
     def sense(self):
-        """One range-sensor scan: cast the layout's rays, map obstacle hits, note casualty hits,
-        and measure the free distance straight ahead (self.clear_ahead)."""
         px, py, pz = self.pos
+        froms, tos = [], []
+        for pd in PITCHES_DEG:
+            cp, sp = math.cos(math.radians(pd)), math.sin(math.radians(pd))
+            for k in range(YAW_RAYS):
+                yaw = 2 * math.pi * k / YAW_RAYS
+                d = (cp * math.cos(yaw), cp * math.sin(yaw), sp)
+                froms.append([px + d[0] * SENSOR_START, py + d[1] * SENSOR_START, pz + d[2] * SENSOR_START])
+                tos.append([px + d[0] * SENSOR_RANGE, py + d[1] * SENSOR_RANGE, pz + d[2] * SENSOR_RANGE])
+
+        # forward corridor along the current direction of travel
         h = self._heading()
-        froms, tos, first_fwd = self.sensor.rays(self.pos, h)
+        n_scan = len(froms)
+        if h is not None:
+            perp = (-h[1], h[0])
+            for off in CORRIDOR_OFFSETS:
+                ox, oy = px + perp[0] * off, py + perp[1] * off
+                froms.append([ox + h[0] * SENSOR_START, oy + h[1] * SENSOR_START, pz])
+                tos.append([ox + h[0] * CORRIDOR_RANGE, oy + h[1] * CORRIDOR_RANGE, pz])
+
         results = p.rayTestBatch(froms, tos)
         self.clear_ahead = float("inf")
-        drone, floor, target = self.drone, self.floor, self.target
-        tube = self.sensor.tube_filter
-        add_hit = self.map.add_hit
-        target_pts, recast = [], []
-        for i, res in enumerate(results):
-            uid = res[0]
-            if uid < 0 or uid == drone or uid == floor:
+        for i, (uid, _link, _frac, hit, _n) in enumerate(results):
+            if uid < 0 or uid == self.drone or uid == self.floor:
                 continue
-            hit = res[3]
-            if uid == target:                         # the casualty is not an obstacle
-                target_pts.append(hit)
-                recast.append((i, hit, res[1]))      # res[1] = link (limb) that was hit
+            if uid == self.target:                    # the casualty is not an obstacle
+                if not self.target_seen:
+                    self.target_seen = True
+                    self.event("TARGET", f"casualty sighted near ({hit[0]:.1f}, {hit[1]:.1f})")
                 continue
-            add_hit(hit)
-            if i >= first_fwd and h is not None:
-                self._ahead(hit, px, py, pz, h, tube)
-        # Enhanced: look THROUGH the casualty, so it never hides an obstacle standing behind it.
-        # A ray that hits one of its limbs is cast again from where it leaves that limb's bounding box.
-        if self.sensor.see_through_target:
-            for _ in range(TARGET_RECAST):
-                if not recast:
-                    break
-                rf, rt, idx = [], [], []
-                for i, hit, link in recast:
-                    f, t = froms[i], tos[i]
-                    d = [t[k] - f[k] for k in range(3)]
-                    n = math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
-                    d = [c / n for c in d]
-                    lo, hi = p.getAABB(target, link)
-                    s_exit = min(((hi[k] if d[k] > 0 else lo[k]) - hit[k]) / d[k]
-                                 for k in range(3) if abs(d[k]) > 1e-9)
-                    start = [hit[k] + d[k] * (max(s_exit, 0.0) + 0.01) for k in range(3)]
-                    if start[2] <= 0.0 or sum((t[k] - start[k]) * d[k] for k in range(3)) <= 0.0:
-                        continue                      # past the ray's end, or under the ground
-                    rf.append(start)
-                    rt.append(t)
-                    idx.append(i)
-                recast = []
-                for i, res in zip(idx, p.rayTestBatch(rf, rt) if rf else ()):
-                    uid, hit = res[0], res[3]
-                    if uid < 0 or uid == drone or uid == floor:
-                        continue
-                    if uid == target:
-                        recast.append((i, hit, res[1]))
-                        continue
-                    add_hit(hit)
-                    if i >= first_fwd and h is not None:
-                        self._ahead(hit, px, py, pz, h, tube)
-        if target_pts:
-            self._casualty_seen(target_pts)
+            self.map.add_hit(hit)
+            if i >= n_scan and h is not None:
+                self.clear_ahead = min(self.clear_ahead, (hit[0] - px) * h[0] + (hit[1] - py) * h[1])
         # an obstacle beyond the next route point is not "in the way" of this leg
         if self.route and self.clear_ahead != float("inf"):
             d0 = math.hypot(self.route[0][0] - px, self.route[0][1] - py)
             if self.clear_ahead > d0 + 0.3:
                 self.clear_ahead = float("inf")
-
-    def _ahead(self, hit, px, py, pz, h, tube):
-        """Update clear_ahead with a forward-ray hit (distance along the heading). With the tube
-        filter, only hits the drone would actually fly into count (not a wall off to the side)."""
-        rx, ry = hit[0] - px, hit[1] - py
-        along = rx * h[0] + ry * h[1]
-        if tube and (along <= 0.0 or abs(ry * h[0] - rx * h[1]) > CORRIDOR_HALF_WIDTH
-                     or abs(hit[2] - pz) > CORRIDOR_HALF_HEIGHT):
-            return
-        if along < self.clear_ahead:
-            self.clear_ahead = along
-
-    def _casualty_seen(self, pts):
-        """Casualty hits: keep a running mean as the location estimate; log the first sighting."""
-        for q in pts:
-            for k in range(3):
-                self._target_sum[k] += q[k]
-        self.target_hits += len(pts)
-        self.target_estimate = [s / self.target_hits for s in self._target_sum]
-        if not self.target_seen:
-            self.target_seen = True
-            e = self.target_estimate
-            self.event("TARGET", f"casualty sighted near ({e[0]:.1f}, {e[1]:.1f})")
 
     def _heading(self):
         if not self.route:
@@ -541,13 +484,10 @@ class Navigator:
             self.event("ABORT", "return-to-launch route blocked too; hovering, awaiting operator")
             return
         if self.alt + CLIMB_STEP <= MAX_ALT + 1e-6:
-            # Never climb into something the sensor has seen overhead (a line, a roof, a canopy).
-            if not (CLIMB_CHECK and self.map.blocked(self.pos[0], self.pos[1], self.alt + CLIMB_STEP)):
-                self.alt += CLIMB_STEP
-                self.state = "CLIMB"
-                self.event("CLIMB", f"no horizontal detour; climbing to {self.alt:.1f} m to look over the obstacle")
-                return
-            self.event("BLOCKED", f"obstacle overhead; cannot climb to {self.alt + CLIMB_STEP:.1f} m here")
+            self.alt += CLIMB_STEP
+            self.state = "CLIMB"
+            self.event("CLIMB", f"no horizontal detour; climbing to {self.alt:.1f} m to look over the obstacle")
+            return
         # Every remaining waypoint is unreachable even at the maximum altitude: name each one (AC-02).
         for s in [r[2] for r in self.route if r[2] is not None]:
             sx, sy = self.wps[s]
@@ -584,11 +524,6 @@ class Navigator:
                     self.on_blocked(f"obstacle {self.clear_ahead:.1f} m dead ahead", emergency=True)
                 else:
                     self.maybe_descend()
-            elif CLIMB_CHECK and self.state == "CLIMB" and self.map.blocked(self.pos[0], self.pos[1], self.alt):
-                # Something overhead showed up during the climb: go back to the altitude we came from.
-                self.alt = max(self.cruise, self.alt - CLIMB_STEP)
-                self.state = "NAV"
-                self.on_blocked("obstacle overhead during climb", emergency=True)
             elif self.state == "CLIMB" and abs(self.pos[2] - self.alt) < 0.05:
                 self.state = "NAV"
                 if not self.replan():
@@ -748,8 +683,6 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--headless", action="store_true", help="no GUI, run as fast as possible")
     ap.add_argument("--no-avoid", action="store_true", help="follow the path blindly (baseline)")
-    ap.add_argument("--sensor", choices=sorted(range_sensor.LAYOUTS), default=SENSOR_LAYOUT,
-                    help=f"range sensor ray layout (default {SENSOR_LAYOUT})")
     ap.add_argument("--blocker", type=float, default=None, metavar="T", help="spawn a wall at sim time T (s)")
     ap.add_argument("--blocker-height", type=float, default=3.5, help="wall height in m (default 3.5)")
     ap.add_argument("--blocker-width", type=float, default=3.0, help="wall width in m (default 3; 24 spans the map)")
@@ -760,8 +693,7 @@ def main():
     gui = not args.headless
     assets = find_assets(args.assets)
     floor_id, drone_id, target_id, obstacle_ids = build_world(gui, assets)
-    nav = Navigator(drone_id, floor_id, target_id, FLIGHT_PATH, gui, print, sensor=args.sensor)
-    print(nav.sensor.describe())
+    nav = Navigator(drone_id, floor_id, target_id, FLIGHT_PATH, gui, print)
     quat = p.getQuaternionFromEuler([0, 0, 0])
     print(f"Simulation initialised. Drone {drone_id}, target {target_id}, "
           f"{len(obstacle_ids)} obstacle bodies. Avoidance {'OFF' if args.no_avoid else 'ON'}.")
