@@ -331,7 +331,8 @@ class OperatorPanel:
             return "bad"
         if low.startswith("received"):
             return "ok"
-        if source in ("START", "DETECT", "ARRIVED", "MISSION") or "found" in low or "searched" in low:
+        if (source in ("START", "DETECT", "ARRIVED", "MISSION") or source.startswith("DETECT ")
+                or "found" in low or "searched" in low):
             return "event"
         return "info"
 
