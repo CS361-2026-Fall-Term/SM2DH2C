@@ -151,6 +151,12 @@ class OperatorPanel:
             self.cmd_btns[cmd] = b
 
         # --- latest message + status + plan
+        header("Detection & Obstacle Panel")
+        self.detection_lbl = tk.Label(frm, text="No events detected yet.", font=self.f_bold, bg="white",
+                                   fg=SUB_FG, anchor="w", justify="left", wraplength=330,
+                                   padx=8, pady=6, relief="groove", bd=2, width=40)
+        self.detection_lbl.grid(row=row, column=0, sticky="we"); row += 1
+
         header("Mission messages")
         self.result_lbl = tk.Label(frm, text="No messages yet.", font=self.f_bold, bg="white",
                                    fg=SUB_FG, anchor="w", justify="left", wraplength=330,
@@ -331,8 +337,7 @@ class OperatorPanel:
             return "bad"
         if low.startswith("received"):
             return "ok"
-        if (source in ("START", "DETECT", "ARRIVED", "MISSION") or source.startswith("DETECT ")
-                or "found" in low or "searched" in low):
+        if source in ("START", "DETECT", "ARRIVED", "MISSION") or "found" in low or "searched" in low:
             return "event"
         return "info"
 
@@ -476,6 +481,12 @@ class OperatorPanel:
             self._set(self.result_lbl, text=msg,
                       fg={"ok": OK_FG, "bad": BAD_FG, "event": EVENT_FG}.get(kind, "#222222"),
                       bg=LATEST_BG[kind])
+        
+        if hasattr(mission, "latest_event") and mission.latest_event:
+            le = mission.latest_event
+            det_text = f"LATEST EVENT: {le.kind} | Distance: {le.distance:.2f}m\nSeverity: {le.severity} | Response: {le.response}"
+            self._set(self.detection_lbl, text=det_text, fg=BAD_FG if le.severity == "CRITICAL" else EVENT_FG)
+            
         if status_text is not None:
             self._set(self.status_lbl, text=status_text)
         if not self._resized:       # labels now hold real text: fit the window to it once
