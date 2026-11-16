@@ -23,3 +23,9 @@ python main.py --detection-log scans     # default: a line per camera scan while
 python main.py --detection-log events    # only sightings and the result
 python -m unittest tests.test_detection_results -v
 ```
+
+PBI-14 (detection and obstacle events in the mission state and on the operator panel), see `tests/MISSION_EVENTS_REPORT.md`:
+```
+python operator_guidance.py --selftest           # sample events through the mission state, no simulator
+python -m unittest tests.test_mission_events -v
+```

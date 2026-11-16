@@ -174,7 +174,7 @@ def apply_operator_command(mission, cmd, zone, nav, belief, reroute=None):
         if res.reroute:
             if mission.destination:
                 reroute(nav, mission.destination)
-            else:                                       # nothing left to search
+            else:                                   # nothing left to search
                 nav.route = []
                 nav.state = "DONE"
     return res
@@ -622,17 +622,10 @@ def main():
         print(f"Person placed at {map_search.fmt(person_xy)}, {d:.1f} m from the nearest zone "
               f"centre (zone {z})")
     person = MissingPerson.spawn(person_xy)
-
-    # Initialize the shared state BEFORE instantiating modules dependent on it
-    mission = Mission()
-
     # PBI-10: every save carries the starting information, so --resume rebuilds this same search.
     store.set_context(setup=setup_from_args(args, person_xy), zones=ZONES)
-    
-    # Pass the shared mission state to SearchMonitor
     # label_dz lifts the detection label above the Navigator's label so they don't overprint.
-    monitor = SearchMonitor(person, gui=gui, label_dz=1.4, log_mode=args.detection_log, mission=mission)
-    
+    monitor = SearchMonitor(person, gui=gui, label_dz=1.4, log_mode=args.detection_log)
     if args.detection_log != "off":
         print(explain_method())                         # PBI-13: what the numbers mean
 
@@ -647,9 +640,11 @@ def main():
         belief.draw_heatmap(budget=belief.grid.size)          # paint every tile once
         p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
 
-    # PBI-13: detection events (possible sighting, lost, FOUND with the estimated location) go to
-    # the mission history, so they appear in the operator panel's message log.
-    monitor.on_event = lambda kind, text: mission.record(f"DETECT {kind}", text)
+    mission = Mission()
+    # PBI-13/14: the detector sends SIGHTING / LOST / FOUND to the shared mission as MissionEvents
+    # (numeric distance, positions); the mission updates its detection state, logs them (panel
+    # message log, save file) and the operator panel shows them.
+    monitor.mission = mission
     if args.zone_order == "map" and resumed is None:   # a resumed mission keeps its saved order
         order, mass = zones_by_probability(belief)
         print("Zone order by probability: " + " -> ".join(f"{z} ({mass[z]:.0%})" for z in order))
@@ -665,9 +660,7 @@ def main():
         # Map objects that could not be read or placed were skipped (details printed above).
         mission.notify("MAP", f"Warning: {len(env_sim.GEO_PROBLEMS)} map object(s) could not be "
                               "read and were left out - see the console. Press START MISSION")
-    
     # Two-point route is replaced when the mission starts.
-    # Pass the shared mission state to Navigator
     # obstacle_info tells the Navigator what each generated obstacle is (name, height, outline).
     nav = Navigator(drone_id, floor_id, person.body_id,
                     [DRONE_START_POS, [DRONE_START_POS[0], DRONE_START_POS[1], 2.5]], gui, print,
@@ -740,7 +733,6 @@ def main():
     if gui:
         # PBI-09 operator controls live only in the Tk operator panel (operator_panel.py).
         # PyBullet's own side panel is hidden, so there is a single set of controls.
-        # NOTE: OperatorPanel does not take `mission` in __init__, it gets it during refresh() instead.
         panel, why = operator_panel.try_open(
             ZONES, list(Cmd), ZONE_COMMANDS,
             directions={z: zone_direction(xy) for z, xy in ZONES.items()})
@@ -805,7 +797,6 @@ def main():
                             last_result = res
                     if not panel.closed:
                         # cheap: only widgets whose text/colour changed are touched
-                        # Panel dynamically updates its detections based on the passed mission instance
                         panel.refresh(mission, selected_zone, lambda z: zone_status(mission, z),
                                       last_result, cam_mode,
                                       f"Navigation: {nav.state}   |   Detection: {monitor.state} "
@@ -889,7 +880,8 @@ def main():
                     # Continuous, vectorized update every step (cheap enough now).
                     belief.observe_camera(monitor, nav.pos, DT, trees=OBSTACLE_POSITIONS)
                     if monitor.found:
-                        mission.found()
+                        if mission.state == "SEARCHING":   # the FOUND event normally did this already
+                            mission.found()
                         nav.route = []
                         nav.state = "FOUND"
 
@@ -915,7 +907,10 @@ def main():
                                 f"Plan: {mission.plan_text()}",
                                 f"Excluded: {', '.join(mission.excluded) or 'none'} | "
                                 f"Searched: {', '.join(mission.visited) or 'none'}",
-                                mission.response or ""]
+                                mission.response or "",
+                                # PBI-14: latest detection / obstacle event
+                                (f"Latest event: {mission.latest_event.summary()}"
+                                 if mission.latest_event else "Latest event: none")]
                         if last_info is None:
                             last_info = [None] * len(info)
                         if status_id is None:
