@@ -18,6 +18,12 @@ Each command is checked against safety rules before anything changes. handle() n
 a bad command (wrong zone, wrong state, wrong type, ...) is rejected with a reason, and the
 time spent validating is measured (target: well under 10 ms).
 
+PBI-14 (detection and obstacle events in the mission state): MissionEvent is the one structure
+both the person detector (target_detection.py) and the navigator (object_avoidance.py) send to
+Mission.add_event(): kind, severity, drone position, object position, distance, time, mission
+state, the drone's response. The mission keeps the latest events (shown on the operator panel),
+updates its detection state (SEARCHING / SIGHTING / FOUND) and logs the important ones.
+
 PBI-10 (mission state is kept so a crash does not lose it): every operator command and every
 system response is logged in Mission.history (record / finish / notify), and snapshot() /
 restore() turn the whole mission into plain data and back (saved by mission_state.py).
@@ -33,6 +39,99 @@ STATES = ("IDLE", "SEARCHING", "FOUND", "ABORT", "COMPLETE")
 # The history keeps every exchange; this cap only stops a runaway loop from growing it forever.
 HISTORY_LIMIT = 2000
 MAX_MESSAGE_LEN = 500
+
+# ---- PBI-14: detection and obstacle events -----------------------------------------------
+SEVERITIES = ("INFO", "WARNING", "CRITICAL")
+DETECTION_STATES = ("SEARCHING", "SIGHTING", "FOUND")
+TARGET_KINDS = ("SIGHTING", "LOST", "FOUND")
+EVENT_LIMIT = 200              # events kept (and saved); older ones are dropped
+# Events also written to the mission history (so to the panel's message log and the save file):
+# the person detector's events and the navigator responses that change what the drone does.
+# Routine ones (each obstacle first seen, re-plans, slowing down) only go to the event list.
+HISTORY_KINDS = TARGET_KINDS + ("UNSAFE", "CLIMB", "UNREACH", "RTL", "ABORT")
+
+
+def _vec3(v, name):
+    if v is None:
+        return None
+    if not (isinstance(v, (list, tuple)) and len(v) == 3 and all(
+            isinstance(c, (int, float)) and not isinstance(c, bool) and math.isfinite(c) for c in v)):
+        raise ValueError(f"{name} must be null or [x, y, z]")
+    return tuple(round(float(c), 3) for c in v)
+
+
+@dataclass
+class MissionEvent:
+    """One detection or obstacle event, the same structure from both modules (PBI-14).
+    distance: metres from the drone to the person (target events) or from the drone's body to the
+    nearest sensed obstacle surface (obstacle events); None if nothing has been sensed yet."""
+    kind: str                       # SIGHTING / LOST / FOUND, or DETECT / UNSAFE / BLOCKED / ...
+    severity: str                   # INFO / WARNING / CRITICAL
+    source: str                     # "target" (person detector) or "obstacle" (navigator)
+    drone_position: tuple           # (x, y, z)
+    object_position: tuple          # (x, y, z) of the person estimate / obstacle point, or None
+    distance: float                 # metres, or None
+    timestamp: float                # sim time (s)
+    mission_state: str = "SEARCHING"
+    detection_state: str = "SEARCHING"
+    response: str = ""              # what the drone does about it, e.g. "re-planning the route"
+    message: str = ""               # the full console text
+    object_name: str = ""           # e.g. 'building "Test Hall"', "Casualty"
+
+    def __post_init__(self):
+        self.drone_position = _vec3(self.drone_position, "drone_position")
+        self.object_position = _vec3(self.object_position, "object_position")
+        if self.distance is not None:
+            self.distance = round(float(self.distance), 3)
+
+    def summary(self):
+        """One readable line, e.g. 'UNSAFE 0.21 m - backing away, re-planning (tree 7)'."""
+        dist = f"{self.distance:.2f} m" if self.distance is not None else "no distance"
+        name = f" ({self.object_name})" if self.object_name else ""
+        return f"{self.kind} {dist} - {self.response or 'logged'}{name}"
+
+    def to_dict(self):
+        return {"kind": self.kind, "severity": self.severity, "source": self.source,
+                "drone_position": list(self.drone_position) if self.drone_position else None,
+                "object_position": list(self.object_position) if self.object_position else None,
+                "distance": self.distance, "timestamp": round(self.timestamp, 3),
+                "mission_state": self.mission_state, "detection_state": self.detection_state,
+                "response": self.response, "message": self.message, "object_name": self.object_name}
+
+    @classmethod
+    def from_dict(cls, d):
+        """Rebuild from saved data; ValueError (never anything else) if it is not valid."""
+        validate_event(d)
+        return cls(**d)
+
+
+def validate_event(d):
+    """Raise ValueError unless d is a well-formed saved event (e.g. read from a damaged file)."""
+    def bad(why):
+        raise ValueError(f"invalid mission event: {why}")
+    if not isinstance(d, dict):
+        bad("not an object")
+    fields = ("kind", "severity", "source", "drone_position", "object_position", "distance",
+              "timestamp", "mission_state", "detection_state", "response", "message", "object_name")
+    if set(d) != set(fields):
+        bad("wrong fields")
+    for key, limit in (("kind", 20), ("source", 20), ("response", 80), ("object_name", 80),
+                       ("message", MAX_MESSAGE_LEN)):
+        if not isinstance(d[key], str) or len(d[key]) > limit:
+            bad(f"{key} must be a short string")
+    if d["severity"] not in SEVERITIES:
+        bad("unknown severity")
+    if d["mission_state"] not in STATES or d["detection_state"] not in DETECTION_STATES:
+        bad("unknown state")
+    _vec3(d["drone_position"], "drone_position")
+    _vec3(d["object_position"], "object_position")
+    for key in ("distance", "timestamp"):
+        v = d[key]
+        if v is None and key == "distance":
+            continue
+        if not (isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0):
+            bad(f"{key} must be a number >= 0")
+
 
 # The center of each search zone, one zone per quadrant (Cartesian plane).
 # Designed for the 26 m map; scale_zones() stretches them for other map sizes.
@@ -106,6 +205,9 @@ class Mission:
         self.response = "Press START"   # Latest message to the operator.
         self.history = []               # (timestamp, command, reply) log of every exchange between operator and drone.
         self.history_count = 0          # lines ever recorded (history itself is capped)
+        self.events = []                # PBI-14: latest MissionEvents (at most EVENT_LIMIT)
+        self.events_count = 0           # events ever added (the list itself is capped)
+        self.detection_state = "SEARCHING"   # SEARCHING / SIGHTING / FOUND (person detector)
 
     # The destination is always set to the front of self.plan. Reordering the plan via operator
     # guidance means it changes the destination (i.e., where the drone goes next). If self.plan
@@ -307,6 +409,41 @@ class Mission:
                              reroute=self.destination != old_dest, sighting=sighting)
 
 
+    # ---- Detection and obstacle events (PBI-14) ------------------------------------------
+    @property
+    def latest_event(self):
+        return self.events[-1] if self.events else None
+
+    def add_event(self, ev):
+        """Take a MissionEvent from the person detector or the navigator. Keeps it (newest last,
+        at most EVENT_LIMIT), updates the detection state (SIGHTING -> SIGHTING, LOST ->
+        SEARCHING, FOUND -> FOUND, which also ends the mission as found) and writes the important
+        ones (HISTORY_KINDS) to the history, so they show in the panel log and are saved."""
+        if ev.severity not in SEVERITIES:
+            raise ValueError(f"unknown severity {ev.severity!r}")
+        if ev.kind in TARGET_KINDS and self.state == "SEARCHING":
+            self.detection_state = {"SIGHTING": "SIGHTING", "LOST": "SEARCHING",
+                                    "FOUND": "FOUND"}[ev.kind]
+        ev.mission_state, ev.detection_state = self.state, self.detection_state
+        self.events.append(ev)
+        self.events_count += 1
+        if len(self.events) > EVENT_LIMIT:
+            del self.events[:len(self.events) - EVENT_LIMIT]
+        if ev.kind in HISTORY_KINDS:
+            source = "DETECT" if ev.source == "target" else "OBSTACLE"
+            dist = f"{ev.distance:.1f} m away" if ev.distance is not None else "no distance"
+            self.record(f"{source} {ev.kind}", f"{ev.kind} (t = {ev.timestamp:.1f} s, {dist}): {ev.message}")
+        if ev.kind == "FOUND" and self.state == "SEARCHING":
+            self.found()                          # mission state: FOUND (logged as well)
+            ev.mission_state = self.state
+        return ev
+
+    def status_text(self):
+        """Mission + detection state and the latest event, for the dashboard."""
+        ev = self.latest_event
+        text = f"Mission: {self.state} | Detection: {self.detection_state}"
+        return text + (f" | Latest: {ev.summary()}" if ev else "")
+
     # ---- Saving and restoring (PBI-10) -------------------------------------------------
     def snapshot(self):
         """Plain-data copy of everything that makes up the mission state (JSON friendly)."""
@@ -319,6 +456,8 @@ class Mission:
             "destination": list(self.destination) if self.destination else None,
             "response": self.response,
             "history": [list(h) for h in self.history],
+            "detection_state": self.detection_state,             # PBI-14
+            "events": [e.to_dict() for e in self.events],
         }
 
     @staticmethod
@@ -358,6 +497,13 @@ class Mission:
             bad("destination must be null or [x, y]")
         if not isinstance(d.get("response"), str) or len(d["response"]) > MAX_MESSAGE_LEN:
             bad("response must be a short string")
+        if d.get("detection_state", "SEARCHING") not in DETECTION_STATES:
+            bad("unknown detection state")
+        events = d.get("events", [])
+        if not isinstance(events, list) or len(events) > EVENT_LIMIT:
+            bad("events must be a list")
+        for e in events:
+            validate_event(e)
         hist = d.get("history")
         if not isinstance(hist, list) or len(hist) > HISTORY_LIMIT:
             bad("history must be a list")
@@ -382,6 +528,9 @@ class Mission:
         self.response = d["response"]
         self.history = [(float(t), s, m) for t, s, m in d["history"]]
         self.history_count = len(self.history)
+        self.detection_state = d.get("detection_state", "SEARCHING")
+        self.events = [MissionEvent(**e) for e in d.get("events", [])]
+        self.events_count = len(self.events)
         self._set_dest()
         if self.state != "SEARCHING":
             self.destination = None
@@ -420,6 +569,56 @@ def selftest():
     m.found()
     assert not m.handle(Cmd.AVOID, "A").ok                     # mission over
     print("selftest passed:", len(m.history), "events logged")
+    selftest_events()
+
+
+def sample_events():
+    """Sample detection and obstacle events, as the detector and navigator would send them."""
+    return [
+        MissionEvent("DETECT", "INFO", "obstacle", (-10, 10, 2.5), (-7.2, 10.1, 2.4), 2.66, 1.2,
+                     response="obstacle mapped", message="tree 1 (3.0 m tall) sensed 2.8 m away",
+                     object_name="tree 1"),
+        MissionEvent("SLOW", "INFO", "obstacle", (-9, 10, 2.5), (-7.2, 10.1, 2.4), 1.68, 1.9,
+                     response="slowing down", message="obstacle 1.8 m ahead; slowing to 1.1 m/s"),
+        MissionEvent("UNSAFE", "CRITICAL", "obstacle", (-8, 10, 2.5), (-7.8, 10.2, 2.5), 0.21, 2.4,
+                     response="backing away and re-planning", message="tree 1 is 0.21 m from the drone",
+                     object_name="tree 1"),
+        MissionEvent("SIGHTING", "WARNING", "target", (2, 2, 2.5), (6.3, -5.9, 0.7), 6.9, 26.0,
+                     response="stopping to look", message="possible person, 6.9 m away",
+                     object_name="Casualty"),
+        MissionEvent("LOST", "INFO", "target", (2, 2, 2.5), (6.3, -5.9, 0.7), 7.4, 30.0,
+                     response="continuing the search", message="sighting not confirmed",
+                     object_name="Casualty"),
+        MissionEvent("SIGHTING", "WARNING", "target", (3, 0, 2.5), (6.3, -5.9, 0.7), 6.1, 40.0,
+                     response="stopping to look", message="possible person, 6.1 m away",
+                     object_name="Casualty"),
+        MissionEvent("FOUND", "INFO", "target", (3, 0, 2.5), (6.35, -5.73, 0.7), 5.9, 41.3,
+                     response="mission complete, holding position",
+                     message="Casualty confirmed (confidence, 5.9 m away)", object_name="Casualty"),
+    ]
+
+
+def selftest_events():
+    """PBI-14 self-test: sample detection and obstacle events through the mission state, no
+    simulator needed (python operator_guidance.py --selftest)."""
+    m = Mission()
+    m.start()
+    expected = ["SEARCHING", "SEARCHING", "SEARCHING", "SIGHTING", "SEARCHING", "SIGHTING", "FOUND"]
+    for ev, want in zip(sample_events(), expected):
+        m.add_event(ev)
+        assert m.detection_state == want, (ev.kind, m.detection_state, want)
+        assert m.latest_event is ev and ev.detection_state == want
+        print(f"  {ev.timestamp:5.1f}s  {ev.summary():<55} -> {m.status_text().split(' | Latest')[0]}")
+    assert m.state == "FOUND"                                    # FOUND ended the mission
+    logged = [h[1] for h in m.history if h[1].startswith(("DETECT", "OBSTACLE"))]
+    assert logged == ["OBSTACLE UNSAFE", "DETECT SIGHTING", "DETECT LOST", "DETECT SIGHTING",
+                      "DETECT FOUND", "DETECT"], logged
+    m2 = Mission()
+    m2.restore(m.snapshot())                                    # events are saved and restored
+    assert [e.to_dict() for e in m2.events] == [e.to_dict() for e in m.events]
+    assert m2.detection_state == "FOUND"
+    print("event selftest passed:", len(m.events), "events,", len(logged), "logged")
+
 
 if __name__ == "__main__":
     import sys

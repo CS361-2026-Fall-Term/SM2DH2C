@@ -37,6 +37,26 @@ LOG_LINES = 7                   # visible lines in the message log (it scrolls)
 LOG_KEEP = 300                  # older messages are dropped past this many
 OK_FG, BAD_FG, SUB_FG, EVENT_FG = "#1b5e20", "#b71c1c", "#555555", "#0d47a1"
 LATEST_BG = {"ok": "#e8f5e9", "bad": "#ffebee", "event": "#e3f2fd", "info": "white"}
+
+# PBI-14: detection & obstacle panel
+EVENT_ROWS = 6                 # recent events listed under the latest one
+SEVERITY_FG = {"INFO": "#1565c0", "WARNING": "#e65100", "CRITICAL": "#c62828"}
+SEVERITY_BG = {"INFO": "#e3f2fd", "WARNING": "#fff3e0", "CRITICAL": "#ffebee"}
+
+
+def format_event_latest(ev):
+    """The latest event, as shown in the panel's big box (PBI-14)."""
+    dist = f"{ev.distance:.2f} m" if ev.distance is not None else "-"
+    obj = f" | {ev.object_name}" if ev.object_name else ""
+    return (f"{ev.kind}  ({ev.severity})  t = {ev.timestamp:.1f} s{obj}\n"
+            f"Distance: {dist}   Drone response: {ev.response or '-'}\n"
+            f"Detection: {ev.detection_state}")
+
+
+def format_event_row(ev):
+    """One line of the recent-events list (PBI-14)."""
+    dist = f"{ev.distance:5.2f} m" if ev.distance is not None else "    - m"
+    return f"{ev.timestamp:6.1f}s  {ev.kind:<8} {dist}  {ev.response}"
 FLASH_MS = 350                  # how long a pressed button stays dark
 
 
@@ -149,6 +169,20 @@ class OperatorPanel:
             b = self._button(cmds, "", colours, lambda cmd=cmd: self._emit(("cmd", cmd)), width=34)
             b.grid(row=i, column=0, sticky="we", pady=1 if c else 2)
             self.cmd_btns[cmd] = b
+
+        # --- PBI-14: detections and obstacles (latest event + recent events)
+        header("Detections & obstacles")
+        self.event_lbl = tk.Label(frm, text="No detection or obstacle events yet.", font=self.f_bold,
+                                  bg="white", fg=SUB_FG, anchor="w", justify="left", wraplength=330,
+                                  padx=8, pady=6, relief="groove", bd=2, width=40)
+        self.event_lbl.grid(row=row, column=0, sticky="we"); row += 1
+        self.event_list = tk.Text(frm, height=3 if c else EVENT_ROWS, width=46, wrap="none",
+                                  font=self.f_small, bg="white", relief="sunken",
+                                  bd=1, padx=4, pady=2, cursor="arrow", state="disabled")
+        self.event_list.grid(row=row, column=0, sticky="we", pady=(4, 0)); row += 1
+        for sev, colour in SEVERITY_FG.items():
+            self.event_list.tag_configure(sev, foreground=colour)
+        self._events_shown = -1     # mission.events_count already drawn
 
         # --- latest message + status + plan
         header("Mission messages")
@@ -334,6 +368,8 @@ class OperatorPanel:
         if (source in ("START", "DETECT", "ARRIVED", "MISSION") or source.startswith("DETECT ")
                 or "found" in low or "searched" in low):
             return "event"
+        if source.startswith("OBSTACLE "):                  # PBI-14: navigator responses
+            return "bad" if source.split()[-1] in ("RTL", "ABORT", "UNSAFE") else "event"
         return "info"
 
     def _add_message(self, ts, source, msg):
@@ -471,6 +507,7 @@ class OperatorPanel:
             self._set(b, text=cmd.value.replace("selected zone", f"Zone {selected}")
                       if cmd in self.zone_commands else cmd.value)
         self._collect_messages(mission)
+        self._refresh_events(mission)
         if self._latest is not None:                    # newest message, whatever its source
             msg, kind = self._latest
             self._set(self.result_lbl, text=msg,
@@ -488,6 +525,25 @@ class OperatorPanel:
                                        f"Excluded: {', '.join(mission.excluded) or 'none'}"))
         if camera_mode:
             self._set(self.cam_btn, text=f"Camera: {camera_mode}")
+
+    def _refresh_events(self, mission):
+        """PBI-14: redraw the detections & obstacles box, only when a new event arrived."""
+        count = getattr(mission, "events_count", 0)
+        if count == self._events_shown:
+            return
+        self._events_shown = count
+        events = getattr(mission, "events", [])
+        if not events:
+            return
+        ev = events[-1]
+        self._set(self.event_lbl, text=format_event_latest(ev), fg=SEVERITY_FG[ev.severity],
+                  bg=SEVERITY_BG[ev.severity])
+        box = self.event_list
+        box.configure(state="normal")
+        box.delete("1.0", "end")
+        for i, e in enumerate(reversed(events[-EVENT_ROWS:])):      # newest first
+            box.insert("end", ("\n" if i else "") + format_event_row(e), e.severity)
+        box.configure(state="disabled")
 
     def close(self):
         """Close from code (end of the simulation): no confirmation."""

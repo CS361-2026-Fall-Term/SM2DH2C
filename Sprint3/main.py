@@ -641,9 +641,10 @@ def main():
         p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
 
     mission = Mission()
-    # PBI-13: detection events (possible sighting, lost, FOUND with the estimated location) go to
-    # the mission history, so they appear in the operator panel's message log.
-    monitor.on_event = lambda kind, text: mission.record(f"DETECT {kind}", text)
+    # PBI-13/14: the detector sends SIGHTING / LOST / FOUND to the shared mission as MissionEvents
+    # (numeric distance, positions); the mission updates its detection state, logs them (panel
+    # message log, save file) and the operator panel shows them.
+    monitor.mission = mission
     if args.zone_order == "map" and resumed is None:   # a resumed mission keeps its saved order
         order, mass = zones_by_probability(belief)
         print("Zone order by probability: " + " -> ".join(f"{z} ({mass[z]:.0%})" for z in order))
@@ -663,7 +664,7 @@ def main():
     # obstacle_info tells the Navigator what each generated obstacle is (name, height, outline).
     nav = Navigator(drone_id, floor_id, person.body_id,
                     [DRONE_START_POS, [DRONE_START_POS[0], DRONE_START_POS[1], 2.5]], gui, print,
-                    obstacle_info=env_sim.OBSTACLE_INFO)
+                    obstacle_info=env_sim.OBSTACLE_INFO, mission=mission)
     nav.route = []
     nav.state = "IDLE"
     nav.alt = 2.5
@@ -879,7 +880,8 @@ def main():
                     # Continuous, vectorized update every step (cheap enough now).
                     belief.observe_camera(monitor, nav.pos, DT, trees=OBSTACLE_POSITIONS)
                     if monitor.found:
-                        mission.found()
+                        if mission.state == "SEARCHING":   # the FOUND event normally did this already
+                            mission.found()
                         nav.route = []
                         nav.state = "FOUND"
 
@@ -905,7 +907,10 @@ def main():
                                 f"Plan: {mission.plan_text()}",
                                 f"Excluded: {', '.join(mission.excluded) or 'none'} | "
                                 f"Searched: {', '.join(mission.visited) or 'none'}",
-                                mission.response or ""]
+                                mission.response or "",
+                                # PBI-14: latest detection / obstacle event
+                                (f"Latest event: {mission.latest_event.summary()}"
+                                 if mission.latest_event else "Latest event: none")]
                         if last_info is None:
                             last_info = [None] * len(info)
                         if status_id is None:

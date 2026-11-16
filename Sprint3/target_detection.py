@@ -36,6 +36,10 @@ PBI-13 (detection results with the confidence level, in the terminal):
   * format_report()   a readable detection summary at the end of the mission.
   log_mode: "scans" (all of the above, default), "events" (only SIGHTING / LOST / FOUND and the
   summary) or "off".
+
+PBI-14: every SIGHTING / LOST / FOUND is also sent to the shared Mission (mission=...) as a
+MissionEvent with the numeric drone-to-person distance, the drone and person positions and the
+time, so the mission's detection state and the operator panel update from it.
 """
 import argparse
 import math
@@ -223,8 +227,11 @@ class SearchMonitor:
 
     def __init__(self, person, gui=False, on_found=None, log=print, seed=0,
                  hfov=CAM_HFOV_DEG, vfov=CAM_VFOV_DEG, pitch=CAM_PITCH_DEG, cam_range=CAM_RANGE,
-                 label_dz=0.8, log_mode="events", on_event=None):
+                 label_dz=0.8, log_mode="events", on_event=None, mission=None):
         self.person, self.gui, self.on_found, self.log = person, gui, on_found, log
+        self.mission = mission        # PBI-14: shared Mission; events go to mission.add_event()
+        self.mission_events = []      # PBI-14: every MissionEvent this detector made
+        self.last_distance = None     # drone (camera) to person, metres, at the last scan
         self.on_event = on_event      # on_event(kind, text): SIGHTING / LOST / FOUND, e.g. for the panel
         if log_mode not in LOG_MODES:
             raise ValueError(f"log_mode must be one of {LOG_MODES}")
@@ -269,11 +276,29 @@ class SearchMonitor:
         self._text_id = None
 
     # ------------------------------------------------------------------ log --
-    def _event(self, kind, msg):
+    def _event(self, kind, msg, cam=None, dist=None):
         self.events.append((self.t, kind, msg))
         self.log(f"[t={self.t:6.2f}s] {kind:<9} {msg}")
         if self.on_event is not None:
             self.on_event(kind, f"{kind} (t = {self.t:.1f} s): {msg}")
+        if kind in ("SIGHTING", "LOST", "FOUND"):
+            self._mission_event(kind, msg, cam, dist)
+
+    def _mission_event(self, kind, msg, cam, dist):
+        """PBI-14: the event as a MissionEvent (numeric distance, positions), sent to the Mission."""
+        from operator_guidance import MissionEvent
+        est = self.estimate if self.estimate is not None else self._current_estimate()
+        ev = MissionEvent(
+            kind=kind, severity={"SIGHTING": "WARNING", "LOST": "INFO", "FOUND": "INFO"}[kind],
+            source="target", drone_position=tuple(cam) if cam is not None else None,
+            object_position=tuple(est) if est is not None else None, distance=dist,
+            timestamp=self.t, response={"SIGHTING": "stopping to look",
+                                        "LOST": "continuing the search",
+                                        "FOUND": "mission complete, holding position"}[kind],
+            message=msg, object_name=self.person.name)
+        self.mission_events.append(ev)
+        if self.mission is not None:
+            self.mission.add_event(ev)
 
     # --------------------------------------------------------------- camera --
     def set_heading(self, yaw_rad):
@@ -342,6 +367,7 @@ class SearchMonitor:
         frac = visible / len(pts)
         centre = self.person.position
         dist = math.dist(cam, centre)
+        self.last_distance = dist
         quality = range_quality(dist, self.range)
         score = frac * quality if frac >= MIN_VISIBLE_FRACTION else 0.0
 
@@ -458,7 +484,7 @@ class SearchMonitor:
                 self.sightings += 1
                 if self.first_sighting_time is None:
                     self.first_sighting_time = self.t
-                self._event("SIGHTING", f"person in clear view, {dist:.1f} m away")
+                self._event("SIGHTING", f"person in clear view, {dist:.1f} m away", cam, dist)
             self.confidence = max(self.confidence, FOUND_AT)
             self.found_by = "clear view"
             self._declare_found(cam)
@@ -469,12 +495,12 @@ class SearchMonitor:
                 self.first_sighting_time = self.t
             self.sightings += 1
             self._event("SIGHTING", f"possible person, {dist:.1f} m away (confidence {self.confidence:.2f} "
-                                    f">= {SIGHTING_ON:.2f})")
+                                    f">= {SIGHTING_ON:.2f})", cam, dist)
         elif self.state == SIGHTING and self.confidence <= SIGHTING_OFF:
             self.state = SEARCHING
             self.losses += 1
             self._event("LOST", f"sighting not confirmed, confidence dropped to {self.confidence:.2f} "
-                                f"(<= {SIGHTING_OFF:.2f})")
+                                f"(<= {SIGHTING_OFF:.2f})", cam, dist)
         if self.state == SIGHTING and self.confidence >= FOUND_AT:
             self.found_by = "confidence"
             self._declare_found(cam)
@@ -486,9 +512,10 @@ class SearchMonitor:
         self.found_drone_pos = list(cam)
         self.estimate = self._current_estimate()
         e = self.estimate
+        dist = math.dist(cam, self.person.position)
         self._event("FOUND", f"{self.person.name} confirmed ({self.found_by}, "
-                             f"{math.dist(cam, self.person.position):.1f} m away). Estimated location "
-                             f"({e[0]:.2f}, {e[1]:.2f}) from {self._n} measurements")
+                             f"{dist:.1f} m away). Estimated location "
+                             f"({e[0]:.2f}, {e[1]:.2f}) from {self._n} measurements", cam, dist)
         if self.gui:
             self.person.mark_found()
         if self.on_found:
