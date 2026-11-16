@@ -240,7 +240,7 @@ class TestOperatorPanel(unittest.TestCase):
         # the panel copies every new history line into its message log
         panel = operator_panel.OperatorPanel.__new__(operator_panel.OperatorPanel)
         panel._hist_n, panel._last_resp, panel.logged = 0, None, []
-        panel._add_message = lambda ts, src, msg: panel.logged.append((src, msg))
+        panel._add_messages = lambda lines: panel.logged.extend((s, m) for _t, s, m in lines)
         panel._collect_messages(mission)
         self.assertIn(found[0][2], [msg for _src, msg in panel.logged])
 

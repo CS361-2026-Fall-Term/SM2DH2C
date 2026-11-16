@@ -17,6 +17,7 @@ import pybullet as p
 FAR_POD_FACTOR = 0.35
 
 HEATMAP_Z = 0.10   # above the OSM ground layers (roads, grass, parking... top out at ~0.08 m)
+HIDDEN_LEVEL = -2  # tile level of a transparent tile (heatmap hidden); -1 = never painted
 
 
 class ProbabilityMap:
@@ -286,16 +287,22 @@ class ProbabilityMap:
             else:
                 self._line_ids.append(p.addUserDebugLine(start, end, color, lineWidth=3))
 
-    def draw_heatmap(self, alpha=0.45, levels=8, budget=40):
+    def draw_heatmap(self, alpha=0.45, levels=8, budget=40, pause_rendering=False):
         """Ground heatmap over every cell, scaled to the most likely cell (log scale, 2 decades):
              green  = most likely (the brightest green is the cell best_target() would pick)
              yellow = about a tenth as likely as the best cell
              red    = 1/100 of the best cell or less: ruled out (searched with no find, or excluded)
         Tiles are visual-only (no collision), so they do not block camera rays
         or obstacle sensing. Only tiles whose color changed are updated, and at most
-        `budget` tiles are recolored per call (largest color changes first) so the cost
-        per frame stays flat. Call it often; the map catches up over a few frames.
-        The first call builds all tiles; do it before the main loop (see main.py)."""
+        `budget` tiles are recolored per call (largest color changes first; None = all).
+        While the heatmap is hidden the tiles are made transparent the same way.
+        The first call builds all tiles; do it before the main loop (see main.py).
+
+        PBI-07: pause_rendering=True recolours with the GUI's rendering paused. In the GUI every
+        changeVisualShape waits for the render thread (5-16 ms per tile, so 8 tiles could take
+        a whole 60-130 ms frame); paused, all 900 tiles take ~30 ms. main.py does this a few times
+        a second for every changed tile instead of a few tiles every frame.
+        Returns the number of tiles recoloured."""
         if not hasattr(self, "_tiles"):
             half = 0.45 * self.cell
             vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[half, half, 0.005],
@@ -311,21 +318,30 @@ class ProbabilityMap:
             self._heat_alpha = alpha
             self.heatmap_visible = True
 
-        if not self.heatmap_visible:
-            return
-
-        level = self.heat_levels(levels)
+        if self.heatmap_visible:
+            level = self.heat_levels(levels)
+        else:                                          # hidden: every tile transparent
+            level = np.full(self.grid.shape, HIDDEN_LEVEL, dtype=int)
 
         diff = np.argwhere(level != self._tile_level)
         if len(diff) == 0:
-            return
-        if len(diff) > budget:
+            return 0
+        if budget is not None and len(diff) > budget:
             change = np.abs(level - self._tile_level)[diff[:, 0], diff[:, 1]]
             diff = diff[np.argsort(-change, kind="stable")[:budget]]
-        for iy, ix in diff:
-            v = level[iy, ix] / (levels - 1)          # 0 = red, 0.5 = yellow, 1 = green
-            p.changeVisualShape(int(self._tiles[iy, ix]), -1, rgbaColor=heat_colour(v, alpha))
-            self._tile_level[iy, ix] = level[iy, ix]   # remember per tile, not all at once
+        if pause_rendering:
+            p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0)
+        try:
+            for iy, ix in diff:
+                lv = level[iy, ix]
+                colour = ([0, 0, 0, 0] if lv == HIDDEN_LEVEL
+                          else heat_colour(lv / (levels - 1), alpha))   # 0 red, 0.5 yellow, 1 green
+                p.changeVisualShape(int(self._tiles[iy, ix]), -1, rgbaColor=colour)
+                self._tile_level[iy, ix] = lv          # remember per tile, not all at once
+        finally:
+            if pause_rendering:
+                p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
+        return len(diff)
 
     def heat_levels(self, levels=8):
         """Heatmap colour level of every cell, 0 (red) .. levels - 1 (green).
@@ -344,18 +360,16 @@ class ProbabilityMap:
         (water, buildings, or ruled out by searching)."""
         return self.heat_levels() == 0
 
-    def set_heatmap_visible(self, visible):
+    def set_heatmap_visible(self, visible, repaint=True):
         """Show or hide the heatmap (operator toggle), e.g. to see the real map underneath.
-        The probability map keeps updating while hidden; showing it again repaints every tile."""
+        The probability map keeps updating while hidden; showing it again repaints every tile.
+        repaint=False only flips the setting: the next draw_heatmap() call does the repaint
+        (PBI-07: main.py lets its batched heatmap update do it, so the click stays instant)."""
         if not hasattr(self, "_tiles") or visible == self.heatmap_visible:
             return
         self.heatmap_visible = visible
-        if visible:
-            self._tile_level[:] = -1                   # force a full repaint
-            self.draw_heatmap(alpha=self._heat_alpha, budget=self._tiles.size)
-        else:
-            for tile in self._tiles.flat:
-                p.changeVisualShape(int(tile), -1, rgbaColor=[0, 0, 0, 0])
+        if repaint:
+            self.draw_heatmap(alpha=self._heat_alpha, budget=None, pause_rendering=True)
 
 def heat_colour(v, alpha):
     """Heatmap colour for v in [0, 1]: red (0) -> yellow (0.5) -> green (1)."""

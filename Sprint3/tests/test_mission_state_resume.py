@@ -113,7 +113,8 @@ class TestPanelLog(unittest.TestCase):
         import operator_panel
         panel = operator_panel.OperatorPanel.__new__(operator_panel.OperatorPanel)
         panel._hist_n, panel._last_resp, panel.logged = 0, None, []
-        panel._add_message = lambda ts, src, msg: panel.logged.append((src, msg))
+        # PBI-07: the panel writes new lines in one batch (_add_messages)
+        panel._add_messages = lambda lines: panel.logged.extend((s, m) for _t, s, m in lines)
         return panel
 
     def test_arrival_appears_once_in_the_log(self):
