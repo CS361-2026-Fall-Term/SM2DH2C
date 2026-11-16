@@ -28,6 +28,17 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 
+@dataclass
+class MissionEvent:
+    kind: str
+    severity: str
+    drone_position: tuple
+    object_position: tuple
+    distance: float
+    timestamp: float
+    mission_state: str
+    response: str = 'N/A'
+
 # Every state a Mission can be in. IDLE -> SEARCHING -> FOUND / ABORT / COMPLETE.
 STATES = ("IDLE", "SEARCHING", "FOUND", "ABORT", "COMPLETE")
 # The history keeps every exchange; this cap only stops a runaway loop from growing it forever.
@@ -106,6 +117,16 @@ class Mission:
         self.response = "Press START"   # Latest message to the operator.
         self.history = []               # (timestamp, command, reply) log of every exchange between operator and drone.
         self.history_count = 0          # lines ever recorded (history itself is capped)
+        self.mission_events = []
+        self.latest_event = None
+
+    def add_mission_event(self, event: MissionEvent):
+        self.mission_events.append(event)
+        self.latest_event = event
+        if event.kind in ["SIGHTING", "LOST", "FOUND"]:
+            self.state = event.mission_state
+            if self.state != "SEARCHING":
+                self.destination = None
 
     # The destination is always set to the front of self.plan. Reordering the plan via operator
     # guidance means it changes the destination (i.e., where the drone goes next). If self.plan
@@ -319,6 +340,12 @@ class Mission:
             "destination": list(self.destination) if self.destination else None,
             "response": self.response,
             "history": [list(h) for h in self.history],
+            "mission_events": [
+                {"kind": e.kind, "severity": e.severity, "drone_position": e.drone_position,
+                 "object_position": e.object_position, "distance": e.distance,
+                 "timestamp": e.timestamp, "mission_state": e.mission_state,
+                 "response": e.response} for e in self.mission_events
+            ]
         }
 
     @staticmethod
@@ -368,6 +395,9 @@ class Mission:
                     and isinstance(h[1], str) and isinstance(h[2], str)
                     and len(h[1]) <= MAX_MESSAGE_LEN and len(h[2]) <= MAX_MESSAGE_LEN):
                 bad("history entries must be [time, source, message]")
+        events = d.get("mission_events", [])
+        if not isinstance(events, list):
+            bad("mission_events must be a list")
 
     def restore(self, d):
         """Load a snapshot written by snapshot(). Raises ValueError (and changes nothing) if it
@@ -382,6 +412,8 @@ class Mission:
         self.response = d["response"]
         self.history = [(float(t), s, m) for t, s, m in d["history"]]
         self.history_count = len(self.history)
+        self.mission_events = [MissionEvent(**e) for e in d.get("mission_events", [])]
+        self.latest_event = self.mission_events[-1] if self.mission_events else None
         self._set_dest()
         if self.state != "SEARCHING":
             self.destination = None
