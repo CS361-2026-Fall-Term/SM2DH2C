@@ -29,3 +29,9 @@ PBI-14 (detection and obstacle events in the mission state and on the operator p
 python operator_guidance.py --selftest           # sample events through the mission state, no simulator
 python -m unittest tests.test_mission_events -v
 ```
+
+PBI-08 (live mission display: six fields together, updates within 300 ms), code in `display_status.py`:
+```
+python -m unittest tests.test_display_pbi08 -v     # AC-01..AC-04 + weak-network cases, no simulator needed
+python main.py --profile                           # per-section timings; the final summary prints "Display latency - ..." for the HUD and the panel
+```
