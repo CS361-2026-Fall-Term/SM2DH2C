@@ -1,5 +1,5 @@
 """
-Contributor: Chase Vanderlip
+Contributor: Chase Vanderlip, Diya Deepu
 File Description: Creates missing person and supports "Found" detection.
 Two parts, both usable on their own or inside another script: 
 MissingPerson - The casualty inside the simulation: a humanoid body (same model, scale and 
@@ -24,18 +24,6 @@ SearchMonitor - The mechanism that decides when the person has been FOUND. A sim
                 States:  SEARCHING -> SIGHTING (possible) -> FOUND (latched).
                 When FOUND, it records time / drone position / estimated location and calls
                 on_found(monitor) callback.
-
-PBI-13 (detection results with the confidence level, in the terminal):
-  * explain_method()  printed once at the start: how the confidence is calculated and what the
-                      numbers mean.
-  * one line per camera scan (10 per second) while the person is in the camera's view or the
-    confidence is above 0, with the confidence, its change, how much of the person was seen, the
-    distance, the range quality, the score of that scan and the clear-view counter. While nothing
-    is in view, one short summary line every IDLE_SUMMARY_S seconds instead of 10 identical lines
-    a second. Every scan is also kept in SearchMonitor.scans (a list of dicts).
-  * format_report()   a readable detection summary at the end of the mission.
-  log_mode: "scans" (all of the above, default), "events" (only SIGHTING / LOST / FOUND and the
-  summary) or "off".
 """
 import argparse
 import math
@@ -88,47 +76,6 @@ MEAS_SIGMA_BASE = 0.10         # position-measurement noise (m) = base + per_m *
 MEAS_SIGMA_PER_M = 0.05
 
 SEARCHING, SIGHTING, FOUND_STATE = "SEARCHING", "SIGHTING", "FOUND"
-
-# terminal output (PBI-13)
-LOG_MODES = ("scans", "events", "off")
-IDLE_SUMMARY_S = 5.0           # one summary line this often while the person is not in view
-HEADER_EVERY = 25              # repeat the column header every this many scan lines
-SCAN_HEADER = (f"{'t (s)':>7}  {'state':<9}  {'conf':>5}  {'change':>6}  {'seen':>4}  "
-               f"{'dist':>6}  {'quality':>7}  {'score':>5}  {'clear':>5}  note")
-
-
-def format_scan(s):
-    """One scan as a fixed-width line matching SCAN_HEADER (PBI-13)."""
-    seen = f"{s['visible']}/{s['points']}" if s["in_view"] else "-"
-    dist = f"{s['dist']:.1f} m" if s["in_view"] else "-"
-    quality = f"{s['quality']:.2f}" if s["in_view"] else "-"
-    return (f"{s['t']:7.2f}  {s['state']:<9}  {s['confidence']:5.2f}  {s['change']:+6.2f}  {seen:>4}  "
-            f"{dist:>6}  {quality:>7}  {s['score']:5.2f}  {s['clear']}/{CLEAR_VIEW_FRAMES:<3}  {s['note']}")
-
-
-def explain_method():
-    """How the confidence is calculated, printed once at the start of a mission (PBI-13)."""
-    return "\n".join([
-        "How the detection confidence works",
-        "----------------------------------",
-        f"  The camera ({CAM_HFOV_DEG:.0f} x {CAM_VFOV_DEG:.0f} deg, tilted {abs(CAM_PITCH_DEG):.0f} deg down, "
-        f"up to {CAM_RANGE:.0f} m) takes {CAM_FPS:.0f} scans per second.",
-        "  Each scan checks 7 points on the person (centre, head, feet, 4 sides):",
-        "    seen     = points inside the image with nothing else in the way (e.g. 5/7)",
-        f"    quality  = how much a scan counts at that distance: 1.00 up to {FULL_QUALITY_RANGE:.0f} m,",
-        f"               falling to {MIN_QUALITY:.2f} at {CAM_RANGE:.0f} m",
-        f"    score    = (seen points / 7) x quality, or 0 if fewer than {MIN_VISIBLE_FRACTION:.0%} are seen",
-        f"  confidence goes up by score x {CONF_GAIN:g} per second while the person is seen. It is kept",
-        f"  for {SIGHTING_MEMORY_S:.0f} s after losing sight, then falls by {CONF_DECAY:g} per second.",
-        f"    >= {SIGHTING_ON:.2f}  possible sighting (SIGHTING, the drone stops to look)",
-        f"    <= {SIGHTING_OFF:.2f}  sighting dropped (LOST)",
-        f"    >= {FOUND_AT:.2f}  person FOUND",
-        f"  Clear view: within {CLEAR_VIEW_RANGE:.0f} m, at least {CLEAR_VIEW_MIN_POINTS} points in the image and "
-        f"{CLEAR_VIEW_FRACTION:.0%} of them unblocked,",
-        f"  for {CLEAR_VIEW_FRAMES} scans in a row (clear 3/3): FOUND straight away (confidence set to "
-        f"{FOUND_AT:.2f}).",
-        "  Columns: t = sim time, conf = confidence after the scan, change = how much this scan",
-        "  added or removed, clear = clear-view scans in a row."])
 
 
 def range_quality(dist, cam_range=CAM_RANGE):
@@ -223,19 +170,9 @@ class SearchMonitor:
 
     def __init__(self, person, gui=False, on_found=None, log=print, seed=0,
                  hfov=CAM_HFOV_DEG, vfov=CAM_VFOV_DEG, pitch=CAM_PITCH_DEG, cam_range=CAM_RANGE,
-                 label_dz=0.8, log_mode="events", on_event=None):
+                 label_dz=0.8, mission=None):
         self.person, self.gui, self.on_found, self.log = person, gui, on_found, log
-        self.on_event = on_event      # on_event(kind, text): SIGHTING / LOST / FOUND, e.g. for the panel
-        if log_mode not in LOG_MODES:
-            raise ValueError(f"log_mode must be one of {LOG_MODES}")
-        self.log_mode = log_mode      # PBI-13: what goes to the terminal (see LOG_MODES)
-        self.scans = []               # every camera scan: dict(t, state, confidence, ...), PBI-13
-        self._lines = 0               # scan lines printed (header repeated every HEADER_EVERY)
-        self._idle_from = None        # first scan of the current stretch without the person in view
-        self._idle_scans = 0
-        self._last_summary_t = None
-        self.sightings = self.losses = 0
-        self.max_confidence = 0.0
+        self.mission = mission
         self.label_dz = label_dz      # height of the status label above the drone (m)
         self.tan_h, self.tan_v = math.tan(math.radians(hfov / 2)), math.tan(math.radians(vfov / 2))
         self.pitch, self.range = math.radians(pitch), cam_range
@@ -269,11 +206,23 @@ class SearchMonitor:
         self._text_id = None
 
     # ------------------------------------------------------------------ log --
-    def _event(self, kind, msg):
+    def _event(self, kind, msg, drone_pos=None, obj_pos=None, dist=None):
         self.events.append((self.t, kind, msg))
         self.log(f"[t={self.t:6.2f}s] {kind:<9} {msg}")
-        if self.on_event is not None:
-            self.on_event(kind, f"{kind} (t = {self.t:.1f} s): {msg}")
+        
+        if self.mission and drone_pos and obj_pos and dist is not None:
+            from operator_guidance import MissionEvent
+            me = MissionEvent(
+                kind=kind,
+                severity="INFO" if kind == "FOUND" else "WARNING",
+                drone_position=tuple(drone_pos),
+                object_position=tuple(obj_pos),
+                distance=dist,
+                timestamp=self.t,
+                mission_state=self.state,
+                response="N/A"
+            )
+            self.mission.add_mission_event(me)
 
     # --------------------------------------------------------------- camera --
     def set_heading(self, yaw_rad):
@@ -358,86 +307,12 @@ class SearchMonitor:
             self.frames_occluded += 1
 
         dt = 1.0 / CAM_FPS
-        before = self.confidence
-        decaying = False
         if score > 0:
             self.confidence += CONF_GAIN * score * dt
         elif self.last_seen_t is None or self.t - self.last_seen_t > SIGHTING_MEMORY_S:
-            decaying = self.confidence > 0
             self.confidence = max(0.0, self.confidence - CONF_DECAY * dt)
         self._update_state(cam, score, dist)
-        self.max_confidence = max(self.max_confidence, self.confidence)
-        if score > 0:
-            note = "clear view" if clear else "seen"
-        elif in_view and visible == 0:
-            note = "in view but hidden (something in front)"
-        elif in_view:
-            note = f"too little visible ({visible}/{len(pts)}, needs {math.ceil(MIN_VISIBLE_FRACTION * len(pts))})"
-        elif decaying:
-            note = "not in view, confidence decaying"
-        elif self.confidence > 0:
-            note = f"not in view, kept for {SIGHTING_MEMORY_S - (self.t - self.last_seen_t):.1f} s"
-        else:
-            note = "not in view"
-        self._record_scan(dict(t=round(self.t, 2), state=self.state, confidence=self.confidence,
-                               change=self.confidence - before, in_view=len(in_view),
-                               visible=visible, points=len(pts), dist=dist, quality=quality,
-                               score=score, clear=min(self.clear_frames, CLEAR_VIEW_FRAMES),
-                               note=note))
         self._draw(cam, centre, score)
-
-    # ------------------------------------------------------- terminal (PBI-13) --
-    def _record_scan(self, scan):
-        """Keep the scan and print it (log_mode "scans"): a line per scan while the person is in
-        view or the confidence is above 0, else a summary line every IDLE_SUMMARY_S seconds."""
-        self.scans.append(scan)
-        if self.log_mode != "scans":
-            return
-        active = scan["in_view"] > 0 or scan["confidence"] > 0 or self.found
-        if active:
-            if self._idle_scans:                          # close the quiet stretch first
-                self._print_idle(self.scans[-2]["t"])
-            if self._lines % HEADER_EVERY == 0:
-                self.log(f"[detect] {SCAN_HEADER}")
-            self._lines += 1
-            self.log("[detect] " + format_scan(scan))
-            return
-        if self._idle_from is None:
-            self._idle_from = scan["t"]
-        self._idle_scans += 1
-        self._idle_conf = scan["confidence"]
-        if scan["t"] - self._idle_from >= IDLE_SUMMARY_S:
-            self._print_idle(scan["t"])
-
-    def _print_idle(self, t):
-        self.log(f"[detect] {self._idle_from:7.2f}-{t:.2f} s  {self.state:<9}  conf "
-                 f"{self._idle_conf:.2f}  person not in the camera view ({self._idle_scans} scans)")
-        self._idle_from, self._idle_scans = None, 0
-
-    def format_report(self):
-        """Readable end-of-mission detection summary (PBI-13)."""
-        r = self.report()
-        lines = ["Detection summary", "-----------------",
-                 f"  Result:           {'FOUND' if r['found'] else 'not found'} "
-                 f"(final state {r['state']}, confidence {r['confidence']:.2f} of {FOUND_AT:.2f})"]
-        if r["found"]:
-            lines.append(f"  Found at:         t = {r['found_time']:.1f} s, by {r['found_by']}"
-                         + (f", {r['found_distance_m']:.1f} m from the person"
-                            if r.get("found_distance_m") is not None else ""))
-        if r["first_sighting_time"] is not None:
-            lines.append(f"  First sighting:   t = {r['first_sighting_time']:.1f} s")
-        lines += [f"  Sightings:        {r['sightings']} raised, {r['losses']} lost again",
-                  f"  Highest conf.:    {r['max_confidence']:.2f}",
-                  f"  Camera scans:     {r['frames']} total, person in view in {r['frames_in_view']}, "
-                  f"seen in {r['frames_seen']}, hidden in {r['frames_occluded']}"]
-        if "estimate" in r:
-            lines.append(f"  Location:         estimated ({r['estimate'][0]:.2f}, {r['estimate'][1]:.2f}), "
-                         f"true ({r['true_position'][0]:.2f}, {r['true_position'][1]:.2f}), "
-                         f"error {r['estimate_error_m']:.2f} m")
-        else:
-            lines.append(f"  Location:         no estimate (never seen); true position "
-                         f"({r['true_position'][0]:.2f}, {r['true_position'][1]:.2f})")
-        return "\n".join(lines)
 
     # ---------------------------------------------------- location estimate --
     def _add_measurement(self, truth, dist):
@@ -455,10 +330,9 @@ class SearchMonitor:
             # Clear view for long enough: found now (a sighting is logged first if there was none).
             if self.state == SEARCHING:
                 self.state = SIGHTING
-                self.sightings += 1
                 if self.first_sighting_time is None:
                     self.first_sighting_time = self.t
-                self._event("SIGHTING", f"person in clear view, {dist:.1f} m away")
+                self._event("SIGHTING", f"person in clear view, {dist:.1f} m away", cam, self.person.position, dist)
             self.confidence = max(self.confidence, FOUND_AT)
             self.found_by = "clear view"
             self._declare_found(cam)
@@ -467,14 +341,10 @@ class SearchMonitor:
             self.state = SIGHTING
             if self.first_sighting_time is None:
                 self.first_sighting_time = self.t
-            self.sightings += 1
-            self._event("SIGHTING", f"possible person, {dist:.1f} m away (confidence {self.confidence:.2f} "
-                                    f">= {SIGHTING_ON:.2f})")
+            self._event("SIGHTING", f"possible person, {dist:.1f} m away (confidence {self.confidence:.2f})", cam, self.person.position, dist)
         elif self.state == SIGHTING and self.confidence <= SIGHTING_OFF:
             self.state = SEARCHING
-            self.losses += 1
-            self._event("LOST", f"sighting not confirmed, confidence dropped to {self.confidence:.2f} "
-                                f"(<= {SIGHTING_OFF:.2f})")
+            self._event("LOST", "sighting not confirmed, confidence dropped", cam, self.person.position, dist)
         if self.state == SIGHTING and self.confidence >= FOUND_AT:
             self.found_by = "confidence"
             self._declare_found(cam)
@@ -486,9 +356,10 @@ class SearchMonitor:
         self.found_drone_pos = list(cam)
         self.estimate = self._current_estimate()
         e = self.estimate
+        dist = math.dist(cam, self.person.position)
         self._event("FOUND", f"{self.person.name} confirmed ({self.found_by}, "
-                             f"{math.dist(cam, self.person.position):.1f} m away). Estimated location "
-                             f"({e[0]:.2f}, {e[1]:.2f}) from {self._n} measurements")
+                             f"{dist:.1f} m away). Estimated location "
+                             f"({e[0]:.2f}, {e[1]:.2f}) from {self._n} measurements", cam, self.person.position, dist)
         if self.gui:
             self.person.mark_found()
         if self.on_found:
@@ -526,10 +397,6 @@ class SearchMonitor:
              "frames_seen": self.frames_seen, "frames_occluded": self.frames_occluded,
              "first_sighting_time": self.first_sighting_time, "found_time": self.found_time,
              "found_by": self.found_by,
-             "found_distance_m": (round(math.dist(self.found_drone_pos, truth), 2)
-                                  if self.found_drone_pos else None),
-             "sightings": self.sightings, "losses": self.losses,
-             "max_confidence": round(self.max_confidence, 2),
              "true_position": [round(truth[0], 2), round(truth[1], 2)]}
         est = self.estimate or self._current_estimate()
         if est:
