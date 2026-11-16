@@ -34,6 +34,7 @@ import time
 import pybullet as p
 import env_sim
 import geo_obstacles
+import display_status
 import operator_panel
 import operator_setup
 import osm_world
@@ -53,7 +54,7 @@ from mission_state import (MissionStateStore, DEFAULT_PATH, setup_from_args,
 # Everything that talks to the PyBullet GUI (button reads, pose push, stepSimulation, camera,
 # heatmap, HUD text, sleeping) happens once per RENDER_EVERY logic steps: 4 -> 60 Hz.
 RENDER_EVERY = 4
-HUD_EVERY = 8                 # HUD text refresh, in render ticks (60 / 8 = 7.5 Hz); only re-sent if changed
+HUD_EVERY = 4                 # HUD text refresh, in render ticks (60 / 4 = 15 Hz = 67 ms; PBI-08 needs < 300 ms); only re-sent if changed
 HUD_LINE_SPACING = 0.045       # HUD line gap per metre of camera distance (debug text has no line breaks)
 BUTTON_POLL_EVERY = 3         # operator buttons are polled every 3rd render tick (20 Hz)
 FOLLOW_VIEW = (8.0, 45.0, -35.0)  # locked chase camera: distance (m), yaw (deg), pitch (deg)
@@ -711,6 +712,9 @@ def main():
                                blocked=viewpoint_blocked, log=print, speed=V_MAX)
     confirmer = SightingConfirm()        # stop and look when the detector has a possible sighting
     yaw = 0.0
+    holding = False                      # hovering to confirm a possible sighting (set every step)
+    latency = display_status.LatencyTracker()   # PBI-08: state change -> drawn, per surface
+    panel_sig = None                     # display state handed to the panel, drawn at its next poll
     previous_xy = nav.pos[:2]
     zone_line_ids = {}                   # zone name -> debug line ids of its outline + pole
     last_result = None                   # latest CommandResult, for the operator panel
@@ -742,7 +746,9 @@ def main():
                              "It needs Tkinter, which comes with the standard Python installer "
                              "from python.org.")
         p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
-        panel.refresh(mission, selected_zone, lambda z: zone_status(mission, z), None, cam_mode)
+        panel.refresh(mission, selected_zone, lambda z: zone_status(mission, z), None, cam_mode,
+                      status_text=display_status.panel_text(
+                          display_status.fields_from_sim(mission, nav, monitor, searcher)))
         if not args.no_dock:
             print("Operator panel", panel.dock())
         # Starting view: the locked chase view, centred on the drone.
@@ -762,6 +768,9 @@ def main():
             if gui and render and (step_count // render_every) % BUTTON_POLL_EVERY == 0:
                 with prof.section("buttons"):
                     events = panel.poll()
+                    if panel_sig is not None:        # Tk has now drawn what refresh() set last time
+                        latency.shown("panel", panel_sig)
+                        panel_sig = None
                     if panel.closed:         # operator closed the panel (and confirmed): end
                         print("Operator panel closed - ending the simulation.")
                         break
@@ -797,10 +806,15 @@ def main():
                             last_result = res
                     if not panel.closed:
                         # cheap: only widgets whose text/colour changed are touched
+                        # PBI-08: the six live fields, always together at the top of the status text
+                        fields = display_status.fields_from_sim(mission, nav, monitor, searcher, holding)
+                        latency.observe(display_status.signature(fields))
                         panel.refresh(mission, selected_zone, lambda z: zone_status(mission, z),
                                       last_result, cam_mode,
+                                      display_status.panel_text(fields) + "\n"
                                       f"Navigation: {nav.state}   |   Detection: {monitor.state} "
                                       f"({monitor.confidence:.2f})" + map_status(searcher, mission))
+                        panel_sig = display_status.signature(fields)
 
             with prof.section("logic"):
                 holding = False
@@ -891,6 +905,12 @@ def main():
                 with prof.section("heatmap"):
                     belief.draw_heatmap(budget=HEATMAP_BUDGET)
 
+                # PBI-08: the six live fields (position, mission state, destination, plan,
+                # moving/stopped, possible sighting); the tracker times change -> drawn.
+                fields = display_status.fields_from_sim(mission, nav, monitor, searcher, holding)
+                sig = display_status.signature(fields)
+                latency.observe(sig)
+
                 # HUD text: only re-sent when the text actually changed. An operator command
                 # forces an immediate refresh, so its confirmation appears on the next frame.
                 if (step_count // render_every) % HUD_EVERY == 0 or force_hud:
@@ -903,11 +923,12 @@ def main():
                         # text item, stacked downward. Only changed lines are re-sent.
                         info = [f"Mission: {mission.state} | Nav: {nav.state} | "
                                 f"Detection: {monitor.state} ({monitor.confidence:.2f})",
+                                display_status.hud_line(fields),
                                 f"Selected zone: {selected_zone} | Next: {nxt} | "
                                 f"Plan: {mission.plan_text()}",
                                 f"Excluded: {', '.join(mission.excluded) or 'none'} | "
                                 f"Searched: {', '.join(mission.visited) or 'none'}",
-                                mission.response or "",
+                                display_status.clip(mission.response or ""),
                                 # PBI-14: latest detection / obstacle event
                                 (f"Latest event: {mission.latest_event.summary()}"
                                  if mission.latest_event else "Latest event: none")]
@@ -931,6 +952,7 @@ def main():
                             if status_id[i] is not None:
                                 kw["replaceItemUniqueId"] = status_id[i]
                             status_id[i] = p.addUserDebugText(line or " ", pos, **kw)
+                        latency.shown("hud", sig)
                         # zones in the 3D view: ground outline + pole + label, colour = status,
                         # thick outline and >> << = selected zone
                         sig = (tuple(mission.plan), tuple(mission.visited), tuple(mission.excluded),
@@ -1037,6 +1059,8 @@ def main():
               f"closest sensed surface {closest} | unsafe-distance alerts {nav.unsafe_alerts} | "
               f"re-plans {nav.replans}")
         print("Events:", mission.history)
+        if gui:
+            print(latency.report())                      # PBI-08: target < 300 ms
         if confirm_times_ms:
             print(f"Operator commands: {len(confirm_times_ms)} | slowest confirmation "
                   f"{max(confirm_times_ms):.1f} ms (target < 1000 ms)")
