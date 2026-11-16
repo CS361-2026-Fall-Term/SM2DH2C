@@ -80,11 +80,22 @@ CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "osm_cache"
 
 
 # ------------------------------------------------------------------ loading OSM data
-CACHE_VERSION = "v3"            # bump when the query changes, so old cached downloads are not reused
+CACHE_VERSION = "v4"            # bump when the query changes, so old cached downloads are not reused
+                                # v4 (BUG-01): areas containing the map, more terrain tags, plazas
+
+# Tag values requested for every supported terrain type (see surface_category()).
+NATURAL_AREAS = "wood|water|scrub|grassland|heath|sand|beach|bare_rock|scree"
+LANDUSE_AREAS = ("forest|grass|meadow|recreation_ground|village_green|cemetery|farmland|farmyard|"
+                 "orchard|vineyard|allotments|construction|brownfield|landfill|reservoir|basin")
+LEISURE_AREAS = "park|garden|pitch|playground|track|golf_course|common|dog_park"
 
 
 def fetch_overpass(lat, lon, area_m=None, timeout=90):
-    """Download OSM features around (lat, lon) from Overpass, cached as JSON."""
+    """Download OSM features around (lat, lon) from Overpass, cached as JSON.
+
+    `around:` only returns a way/relation whose OUTLINE passes within the radius, so a big forest,
+    lake or park that surrounds the whole search area would be missed (BUG-01). is_in() + pivot also
+    fetches every terrain area that CONTAINS the LKP or any corner of the search square."""
     area_m = sim_config.map_size() if area_m is None else area_m
     radius = math.ceil(area_m / 2 * math.sqrt(2)) + 5      # circle that covers the whole square
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -96,9 +107,21 @@ def fetch_overpass(lat, lon, area_m=None, timeout=90):
         except (OSError, ValueError) as exc:        # damaged cache file: download again
             print(f"Cached map data {os.path.basename(cache)} is unreadable ({exc}); downloading again.")
     around = f"(around:{radius},{lat},{lon})"
+
+    # LKP + the 4 corners of the search square (metres -> degrees).
+    dlat = area_m / 2 / 111320.0
+    dlon = area_m / 2 / (111320.0 * math.cos(math.radians(lat)))
+    points = [(lat, lon)] + [(lat + sy * dlat, lon + sx * dlon) for sx in (-1, 1) for sy in (-1, 1)]
+    contains = "".join(f"is_in({a:.7f},{b:.7f})->.a{k};\n" for k, (a, b) in enumerate(points))
+    inside = "".join(
+        f'  {kind}(pivot.a{k})["natural"~"^({NATURAL_AREAS})$"];\n'
+        f'  {kind}(pivot.a{k})["landuse"~"^({LANDUSE_AREAS})$"];\n'
+        f'  {kind}(pivot.a{k})["leisure"~"^({LEISURE_AREAS})$"];\n'
+        for k in range(len(points)) for kind in ("way", "relation"))
+
     # ways AND multipolygon relations: big or complex buildings, parks and forests are often relations
     query = f"""[out:json][timeout:{timeout}];
-(
+{contains}(
   way["building"]{around};
   relation["building"]{around};
   way["building:part"]{around};
@@ -106,22 +129,26 @@ def fetch_overpass(lat, lon, area_m=None, timeout=90):
   way["barrier"~"^(hedge|fence|wall|retaining_wall|city_wall|guard_rail)$"]{around};
   node["natural"="tree"]{around};
   way["natural"]{around};
-  relation["natural"~"^(wood|water|scrub|grassland|heath|sand|beach|bare_rock)$"]{around};
+  relation["natural"~"^({NATURAL_AREAS})$"]{around};
   way["landuse"]{around};
-  relation["landuse"~"^(forest|grass|meadow|recreation_ground|village_green|cemetery|farmland|construction)$"]{around};
+  relation["landuse"~"^({LANDUSE_AREAS})$"]{around};
   way["leisure"]{around};
-  relation["leisure"~"^(park|garden|pitch|playground|track|golf_course)$"]{around};
-  way["amenity"="parking"]{around};
-  relation["amenity"="parking"]{around};
+  relation["leisure"~"^({LEISURE_AREAS})$"]{around};
+  way["amenity"~"^(parking|marketplace)$"]{around};
+  relation["amenity"~"^(parking|marketplace)$"]{around};
+  way["place"="square"]{around};
+  relation["place"="square"]{around};
   way["highway"]{around};
   way["waterway"]{around};
+  relation["waterway"="riverbank"]{around};
   way["railway"~"^(rail|light_rail|tram|narrow_gauge)$"]{around};
-);
+{inside});
 out geom;"""
     result = _download(query, timeout)
     with open(cache, "w") as f:
         json.dump(result, f)
     return result
+
 
 
 class OverpassUnavailable(RuntimeError):
@@ -395,8 +422,11 @@ def ring_to_xy(geometry, to_xy):
     return cleaned
 
 
-def building_height(tags, scale):
-    """Real height from OSM tags, scaled, then clamped so it is always a meaningful obstacle."""
+def building_height(tags, scale, clamp=True):
+    """Real height from OSM tags, scaled. clamp=True (collision) caps it at MAX_BUILDING_HEIGHT so it
+    is always a solid obstacle the drone routes around; clamp=False (visual) keeps the real scaled
+    height so tall buildings are drawn full size (BUG-01)."""
+
     h = None
     for key in ("height", "building:height"):
         try:
@@ -410,24 +440,27 @@ def building_height(tags, scale):
         except ValueError:
             pass
     h = DEFAULT_BUILDING_HEIGHT if h is None else h
-    return max(MIN_BUILDING_HEIGHT, min(MAX_BUILDING_HEIGHT, h * scale))
+    h = max(MIN_BUILDING_HEIGHT, h * scale)
+    return min(MAX_BUILDING_HEIGHT, h) if clamp else h
+
 
 
 def building_info(tags, scale):
     """Height (sim m, clamped like before) plus what the building should look like."""
-    h = building_height(tags, scale)
+    h = building_height(tags, scale)                       # collision (clamped)
+    vis_h = building_height(tags, scale, clamp=False)      # drawn height (BUG-01)
     # storeys: from the tag if present, else from the real height; used for the window grid
     try:
         storeys = max(1, int(round(float(tags.get("building:levels")))))
     except (TypeError, ValueError):
-        storeys = max(1, int(round(h / scale / BUILDING_LEVEL_HEIGHT)))
+        storeys = max(1, int(round(vis_h / scale / BUILDING_LEVEL_HEIGHT)))
     kind = tags.get("building", "yes")
     material = str(tags.get("building:material", "")).lower()
     if material in MATERIAL_STYLE:
         style = MATERIAL_STYLE[material]
     else:
         style = next((s for s, kinds in BUILDING_STYLE_KINDS.items() if kind in kinds), "stucco")
-    return h, {"style": style, "storeys": storeys, "kind": kind, "name": tags.get("name"),
+    return h, {"visual_height": vis_h, "style": style, "storeys": storeys, "kind": kind, "name": tags.get("name"),
                "wall": tags.get("building:colour"), "roof": tags.get("roof:colour"),
                "roof_shape": roof_shape(tags, kind), "roof_height": _metres(tags.get("roof:height")),
                "material_set": material in MATERIAL_STYLE}
@@ -542,7 +575,8 @@ def surface_category(tags):
     """Which flat ground surface an area represents, or None (e.g. landuse=residential is a zoning
     area, not a surface, so it is not drawn)."""
     lu, le, na, am = (tags.get(k) for k in ("landuse", "leisure", "natural", "amenity"))
-    if na == "water" or lu in ("reservoir", "basin") or tags.get("water"):
+    if (na == "water" or lu in ("reservoir", "basin") or tags.get("water")
+            or tags.get("waterway") == "riverbank"):          # BUG-01: old-style river area
         return "water"
     if am == "parking":
         return "parking"
@@ -720,7 +754,8 @@ def parse_scene(osm_json, lat, lon, area_m=DEFAULT_AREA_M, keep_clear=(), seed=0
             return
         closed = len(geom) >= 4 and geom[0] == geom[-1]
         pts = ring_to_xy(geom, to_xy)
-        is_line = ("highway" in tags and tags.get("area") != "yes") or "waterway" in tags \
+        is_line = ("highway" in tags and tags.get("area") != "yes") \
+            or ("waterway" in tags and tags["waterway"] != "riverbank") \
             or "railway" in tags or ("barrier" in tags and "building" not in tags)
         if is_line:
             add_line(pts, tags)
@@ -1374,6 +1409,7 @@ def _detailed_buildings(p, va, scene, solid_ids, solids=True):
             col, mesh = -1, building_mesh(poly, h)
         if col is None or mesh is None:
             continue
+        vh = info.get("visual_height", h)        # BUG-01: draw at the real scaled height
         try:
             vpoly, tol = poly, 0.02           # visual outline: simplify very detailed footprints
             while 4 * len(vpoly) > va.MAX_VERTS and tol < 2.0:
@@ -1383,7 +1419,7 @@ def _detailed_buildings(p, va, scene, solid_ids, solids=True):
             parts = parts_of.get(bi)
             if parts:
                 top = max(pi["top"] for _, pi in parts)
-                k = h / max(top, 1e-6)        # tallest part reaches the building's (clamped) height
+                k = vh / max(top, 1e-6) # tallest part reaches the building's real scaled height
                 for part_poly, pi in parts:
                     pstyle = pi.get("style") or style
                     pwall = va.parse_colour(pi.get("wall")) or wall
@@ -1397,8 +1433,8 @@ def _detailed_buildings(p, va, scene, solid_ids, solids=True):
                                     [tuple((under[i][0], under[i][1], z0) for i in t)
                                      for t in triangulate(under)], up=True)
             else:
-                storey_h = h / max(1, info.get("storeys", 1))
-                _solid_visual(va, groups, vpoly, 0.0, h, style, wall, roof, shape, storey_h, s,
+                storey_h = vh / max(1, info.get("storeys", 1))
+                _solid_visual(va, groups, vpoly, 0.0, vh, style, wall, roof, shape, storey_h, s,
                               roof_height=info.get("roof_height"))
             if solids:
                 solid_ids.append(_invisible_solid(p, col, poly))
