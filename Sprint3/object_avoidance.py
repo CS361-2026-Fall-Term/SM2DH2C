@@ -476,11 +476,12 @@ class ObstacleMap:
 class Navigator:
     """Sense -> detect blocked route -> respond. Owns the drone's motion."""
 
-    def __init__(self, drone_id, floor_id, target_id, waypoints, gui, log, obstacle_info=None):
+    def __init__(self, drone_id, floor_id, target_id, waypoints, gui, log, obstacle_info=None, mission=None):
         """obstacle_info: {PyBullet body id: geo_obstacles.Obstacle} for the world's generated
         obstacles (env_sim.OBSTACLE_INFO). Optional: without it every hit is an unnamed obstacle."""
         self.drone, self.floor, self.target = drone_id, floor_id, target_id
         self.obstacle_info = obstacle_info if obstacle_info is not None else {}
+        self.mission = mission
         self.sensor_mode = SENSOR_MODE   # "enhanced" or "baseline" (PBI-12 AC-03 comparison)
         self.climbs = 0              # times the drone chose to climb over an obstacle (PBI-12 AC-04)
         self.detected = {}           # body id -> [sim time first sensed, closest sensed range (m)]
@@ -519,9 +520,23 @@ class Navigator:
         self.horizontal_speed = 0.0  # ramp velocity instead of instant acceleration
 
     # ---------------------------------------------------------------- log --
-    def event(self, kind, msg):
+    def event(self, kind, msg, drone_pos=None, obs_pos=None, distance=None, response="N/A"):
         self.events.append((self.t, kind, msg))
         self.log(f"[t={self.t:6.2f}s] {kind:<8} {msg}")
+        
+        if self.mission and drone_pos and obs_pos and distance is not None:
+            from operator_guidance import MissionEvent
+            me = MissionEvent(
+                kind=kind,
+                severity="CRITICAL" if distance < 2.0 else "WARNING",
+                drone_position=tuple(drone_pos),
+                object_position=tuple(obs_pos),
+                distance=distance,
+                timestamp=self.t,
+                mission_state=self.mission.state,
+                response=response
+            )
+            self.mission.add_mission_event(me)
 
     # ------------------------------------------------------------- SENSE --
     def _baseline_rays(self, px, py, pz):
@@ -637,10 +652,10 @@ class Navigator:
         ob = self.obstacle_info.get(uid)
         if ob is None:
             self.event("DETECT", f"unmapped obstacle sensed {rng:.1f} m away near "
-                                 f"({hit[0]:.1f}, {hit[1]:.1f})")
+                                 f"({hit[0]:.1f}, {hit[1]:.1f})", self.pos, hit, rng, "logged")
             return
         self.event("DETECT", f"{ob.name} ({ob.height:.1f} m tall) sensed {rng:.1f} m away, "
-                             f"centre ({ob.cx:.1f}, {ob.cy:.1f})")
+                             f"centre ({ob.cx:.1f}, {ob.cy:.1f})", self.pos, hit, rng, "logged")
         if ob.footprint:
             self.map.add_footprint(ob.footprint, ob.height)
 
@@ -662,8 +677,9 @@ class Navigator:
                 self._unsafe = True
                 self._unsafe_replan = True
                 self.unsafe_alerts += 1
+                hit_pos = close_hits[0] if close_hits else self.pos
                 self.event("UNSAFE", f"{self.obstacle_name(uid)} is {clearance:.2f} m from the drone, "
-                                     f"inside the {UNSAFE_DIST:.2f} m unsafe distance")
+                                     f"inside the {UNSAFE_DIST:.2f} m unsafe distance", self.pos, hit_pos, clearance, "backing away")
         elif clearance > UNSAFE_DIST + UNSAFE_CLEAR:
             self._unsafe = False
 
@@ -717,10 +733,12 @@ class Navigator:
         descend to it on the spot: the column above / below it must be free."""
         if not CLIMB_OVER:
             return [self.alt]
-        levels, a = [], self.cruise
+        levels, a = self.cruise, self.cruise
+        usable_levels = []
         while a <= MAX_ALT + 1e-6:
-            levels.append(round(a, 3))
+            usable_levels.append(round(a, 3))
             a += FLIGHT_LEVEL_STEP
+        levels = usable_levels
         usable = [self.alt]
         for direction in (1, -1):                # going up, then going down from the current level
             for a in sorted((x for x in levels if (x - self.alt) * direction > 1e-6),
@@ -839,7 +857,13 @@ class Navigator:
         if not emergency and self.t - self.last_replan_t < REPLAN_COOLDOWN:
             return
         self.last_replan_t = self.t
-        self.event("BLOCKED", reason)
+        dist = self.clear_ahead if self.clear_ahead != float("inf") else 0.0
+        obs_pos = self.ahead_hit if self.ahead_hit else self.pos
+        resp = "re-plan"
+        if self.state == "RTL": resp = "awaiting operator"
+        elif self.alt + CLIMB_STEP <= MAX_ALT + 1e-6: resp = "climb"
+        self.event("BLOCKED", reason, self.pos, obs_pos, dist, response=resp)
+
         if emergency:
             self.emergency_stops += 1
         # a detour that keeps ending in emergency stops is not working: escalate (climb / RTL)
