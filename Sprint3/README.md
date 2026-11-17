@@ -43,3 +43,10 @@ PBI-08 (live mission display: six fields together, updates within 300 ms), code 
 python -m unittest tests.test_display_pbi08 -v     # AC-01..AC-04 + weak-network cases, no simulator needed
 python main.py --profile                           # per-section timings; the final summary prints "Display latency - ..." for the HUD and the panel
 ```
+
+PBI-02 (simulation stability and performance), code in `stability.py`, see `tests/STABILITY_PERFORMANCE_REPORT.md`:
+```
+python main.py --metrics                     # any mission: PASS/FAIL table of the performance metrics at the end
+python stability_runs.py                     # 16 full missions, writes tests/STABILITY_RUNS.md (--quick: 3 runs)
+python -m unittest tests.test_stability_pbi02 -v
+```

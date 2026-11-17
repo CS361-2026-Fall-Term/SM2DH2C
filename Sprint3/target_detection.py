@@ -97,6 +97,7 @@ SEARCHING, SIGHTING, FOUND_STATE = "SEARCHING", "SIGHTING", "FOUND"
 LOG_MODES = ("scans", "events", "off")
 IDLE_SUMMARY_S = 5.0           # one summary line this often while the person is not in view
 HEADER_EVERY = 25              # repeat the column header every this many scan lines
+SCAN_LOG_LIMIT = 3000          # PBI-02: SearchMonitor.scans keeps the newest this many (5 min of scans)
 SCAN_HEADER = (f"{'t (s)':>7}  {'state':<9}  {'conf':>5}  {'change':>6}  {'seen':>4}  "
                f"{'dist':>6}  {'quality':>7}  {'score':>5}  {'clear':>5}  note")
 
@@ -417,6 +418,8 @@ class SearchMonitor:
         """Keep the scan and print it (log_mode "scans"): a line per scan while the person is in
         view or the confidence is above 0, else a summary line every IDLE_SUMMARY_S seconds."""
         self.scans.append(scan)
+        if len(self.scans) > SCAN_LOG_LIMIT:                   # PBI-02: bounded memory
+            del self.scans[:len(self.scans) - SCAN_LOG_LIMIT]
         if self.log_mode != "scans":
             return
         active = scan["in_view"] > 0 or scan["confidence"] > 0 or self.found

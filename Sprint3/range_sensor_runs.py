@@ -202,7 +202,7 @@ def target_case(case, with_target):
     r = fly(nav, drone)
     events = [(round(tt, 3), k, m) for tt, k, m in nav.events if k != "TARGET"]
     return {"label": label, "target": target, "nav": nav, "events": events,
-            "map": {c: frozenset(z) for c, z in nav.map.block.items()},
+            "map": dict(nav.map.block),
             "target_seen": nav.target_seen, "track": r["track"]}
 
 

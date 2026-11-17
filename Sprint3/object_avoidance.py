@@ -136,6 +136,8 @@ REPLAN_COOLDOWN = 0.5          # s between sensor-triggered re-plans (hard stops
 SHOW_HIT_MARKS = True          # False = don't draw LIDAR hits at all.
 MAX_HIT_MARKS = 400            # Oldest marks are recycled past this many.
 HIT_MARKS_PER_DRAW = 60        # Cap per redraw (every 0.25 s) to keep frames smooth.
+# PBI-02: in-memory logs are capped so a long mission does not keep growing in memory.
+EVENT_LOG_LIMIT = 5000         # Navigator.events and .mission_events keep the newest this many
 
 CRASH_DIST = 0.0               # Body distance <= this counts as contact (safety report only).
 # Unsafe distance, measured from the drone's collision body to an obstacle surface. Used by the
@@ -146,6 +148,8 @@ UNSAFE_CLEAR = 0.05            # The alert ends once the drone is this far outsi
 KEEPOUT_EXTRA = 0.25           # Extra margin (one map cell) put around a surface that got too close.
 ESCAPE_RADIUS = 2.0            # How far to look for a free spot when the drone is inside a margin.
 
+
+_ALT_MASKS = {}                # altitude -> bucket mask (ObstacleMap._alt_mask cache)
 
 # Top assumed for a surface whose height is unknown: above anything the drone may fly at.
 UNKNOWN_TOP = MAX_ALT + VERT_CLEAR + Z_BUCKET
@@ -207,7 +211,10 @@ class ObstacleMap:
     def __init__(self):
         self.half = sim_config.MAP_HALF       # map covers [-half, half] in x and y
         self.n = int(round(2 * self.half / CELL))
-        self.block = {}                       # (ix, iy) -> set(z buckets)
+        # (ix, iy) -> bit mask of blocked height buckets (bit k = Z_BUCKET * k .. + Z_BUCKET).
+        # PBI-02: was a set of bucket numbers per cell; an int mask needs ~3x less memory (the map
+        # grows with the explored area) and makes every "blocked here?" check one AND.
+        self.block = {}
         r = int(math.ceil(SAFETY_RADIUS / CELL))
         self.disc = [(dx, dy) for dx in range(-r, r + 1) for dy in range(-r, r + 1)
                      if math.hypot(dx, dy) * CELL <= SAFETY_RADIUS]
@@ -234,6 +241,24 @@ class ObstacleMap:
         hi = int(math.floor((alt + VERT_CLEAR) / Z_BUCKET))
         return range(lo, hi + 1)
 
+    @staticmethod
+    def _mask(lo, hi):
+        """Bit mask of height buckets lo..hi (negative buckets, below the ground, are dropped)."""
+        lo = max(lo, 0)
+        return 0 if hi < lo else ((1 << (hi + 1)) - 1) ^ ((1 << lo) - 1)
+
+    @classmethod
+    def _alt_mask(cls, alt):
+        """Mask of the buckets within VERT_CLEAR of `alt` (what blocked() tests against)."""
+        m = _ALT_MASKS.get(alt)
+        if m is None:
+            b = cls._buckets(alt)
+            m = _ALT_MASKS[alt] = cls._mask(b.start, b.stop - 1)
+        return m
+
+    def _block(self, c, mask):
+        self.block[c] = self.block.get(c, 0) | mask
+
     # --- updates
     def add_hit(self, pt, top=None):
         """A sensed surface point, inflated by SAFETY_RADIUS. The obstacle is blocked from the hit
@@ -248,10 +273,9 @@ class ObstacleMap:
         self.version += 1
         self.new_hits.append(pt)
         ztop = UNKNOWN_TOP if top is None else max(top, pt[2])
-        column = range(zb, int(math.floor(ztop / Z_BUCKET)) + 1)
+        column = self._mask(zb, int(math.floor(ztop / Z_BUCKET)))
         for dx, dy in self.disc:
-            cc = (c[0] + dx, c[1] + dy)
-            self.block.setdefault(cc, set()).update(column)
+            self._block((c[0] + dx, c[1] + dy), column)
         return True
 
     def add_keepout(self, pt, radius):
@@ -264,10 +288,11 @@ class ObstacleMap:
             return False
         self.keepouts.add((c, zb, r))
         self.version += 1
+        bit = self._mask(zb, zb)
         for dx in range(-r, r + 1):
             for dy in range(-r, r + 1):
                 if math.hypot(dx, dy) * CELL <= radius:
-                    self.block.setdefault((c[0] + dx, c[1] + dy), set()).add(zb)
+                    self._block((c[0] + dx, c[1] + dy), bit)
         return True
 
     def add_footprint(self, outline, top, base=0.0):
@@ -313,9 +338,9 @@ class ObstacleMap:
                     c = (c0[0] + dx, c0[1] + dy)
                     if c not in cells and _segment_dist(self.to_xy(c), a, b) <= reach:
                         cells.add(c)
-        column = set(range(int(math.floor(base / Z_BUCKET)), int(math.floor(top / Z_BUCKET)) + 1))
+        column = self._mask(int(math.floor(base / Z_BUCKET)), int(math.floor(top / Z_BUCKET)))
         for c in cells:
-            self.block.setdefault(c, set()).update(column)
+            self._block(c, column)
         self.version += 1
         return len(cells)
 
@@ -323,10 +348,7 @@ class ObstacleMap:
     def blocked_cell(self, c, alt):
         if not self.in_bounds(c):
             return True
-        s = self.block.get(c)
-        if not s:
-            return False
-        return any(b in s for b in self._buckets(alt))
+        return bool(self.block.get(c, 0) & self._alt_mask(alt))
 
     def blocked(self, x, y, alt):
         return self.blocked_cell(self.to_cell(x, y), alt)
@@ -358,10 +380,10 @@ class ObstacleMap:
     def _blocked_grid(self, alt):
         """Flat bytearray over every cell (index ix * n + iy): 1 = blocked at this altitude.
         Built once per A* call so the search does plain array lookups (PBI-04 AC-03)."""
-        n, buckets = self.n, self._buckets(alt)
+        n, amask = self.n, self._alt_mask(alt)
         grid = bytearray(n * n)
-        for (ix, iy), s in self.block.items():
-            if 0 <= ix < n and 0 <= iy < n and any(b in s for b in buckets):
+        for (ix, iy), m in self.block.items():
+            if m & amask and 0 <= ix < n and 0 <= iy < n:
                 grid[ix * n + iy] = 1
         return grid
 
@@ -547,6 +569,8 @@ class Navigator:
         distance to the obstacle (default: the nearest surface at the last scan) and the drone's
         response, sent to the shared Mission (PBI-14). The console line is unchanged."""
         self.events.append((self.t, kind, msg))
+        if len(self.events) > EVENT_LOG_LIMIT:                 # PBI-02: bounded memory
+            del self.events[:len(self.events) - EVENT_LOG_LIMIT]
         self.log(f"[t={self.t:6.2f}s] {kind:<8} {msg}")
         if kind not in OBSTACLE_RESPONSES:
             return
@@ -566,6 +590,8 @@ class Navigator:
             response=response or OBSTACLE_RESPONSES[kind], message=msg,
             object_name=self.obstacle_name(uid) if uid is not None else "")
         self.mission_events.append(ev)
+        if len(self.mission_events) > EVENT_LOG_LIMIT:         # PBI-02: bounded memory
+            del self.mission_events[:len(self.mission_events) - EVENT_LOG_LIMIT]
         if self.mission is not None:
             self.mission.add_event(ev)
 
@@ -1034,7 +1060,14 @@ class Navigator:
 
     def draw_status(self):
         if not self.gui:
+            # PBI-02: nothing draws the hit marks without a window; the list used to grow with
+            # every new sensor hit for the whole mission (memory kept rising).
+            self.map.new_hits.clear()
             return
+        # PBI-02: only the newest MAX_HIT_MARKS can ever be on screen (the marks are a ring
+        # buffer), so a backlog in dense areas is trimmed instead of being drawn seconds late.
+        if len(self.map.new_hits) > MAX_HIT_MARKS:
+            del self.map.new_hits[:len(self.map.new_hits) - MAX_HIT_MARKS]
         # Obstacle hits are drawn as short red line marks, NOT addUserDebugPoints:
         # on some PyBullet builds debug points break the GUI font, so every button and
         # slider label goes blank as soon as the LIDAR starts reporting hits.
