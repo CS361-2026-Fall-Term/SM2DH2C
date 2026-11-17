@@ -42,7 +42,7 @@ import sim_config
 import terrain_prior
 import map_search
 from env_sim import build_world, FLIGHT_PATH, DRONE_START_POS, OBSTACLE_POSITIONS
-from object_avoidance import Navigator, DT, V_MAX
+from object_avoidance import Navigator, DT, V_MAX, V_Z, MAX_ALT
 from target_detection import MissingPerson, SearchMonitor, explain_method, LOG_MODES
 from operator_guidance import Mission, Cmd, ZONES, ZONE_COMMANDS, scale_zones
 from map_search import MapGuidedSearch, SightingConfirm
@@ -50,6 +50,7 @@ from probability_map import ProbabilityMap
 from mission_state import (MissionStateStore, BackgroundSaver, DEFAULT_PATH, setup_from_args,
                            apply_setup_to_args, describe, restore_belief)
 from ui_responsiveness import CommandPipeline, ResponseTimer
+from stability import StabilityMonitor
 
 # Mission logic (navigation, detection, probability map) still advances every DT (240 Hz).
 # Everything that talks to the PyBullet GUI (button reads, pose push, stepSimulation, camera,
@@ -443,11 +444,38 @@ def _setup_prefill(args):
     return pre
 
 
+def parse_command_script(text):
+    """--command-script "20:AVOID:C,45:REINCLUDE:C,60:RETURN_PLAN" -> [(20.0, "AVOID", "C"), ...]
+    (sim time in s, command name, zone or None), sorted by time. ValueError if malformed."""
+    out = []
+    for item in (text or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        parts = item.split(":")
+        if len(parts) not in (2, 3):
+            raise ValueError(f"'{item}' is not TIME:COMMAND[:ZONE]")
+        t = float(parts[0])
+        if not math.isfinite(t) or t < 0:
+            raise ValueError(f"'{item}': time must be >= 0")
+        out.append((t, parts[1].strip().upper(), parts[2].strip().upper() if len(parts) == 3 else None))
+    return sorted(out, key=lambda c: c[0])
+
+
 def main():
+    perf = None                                    # PBI-02 StabilityMonitor, made once args are known
+    t_program = time.perf_counter()
     parser = argparse.ArgumentParser()
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--max-time", type=float, default=None,
                         help="sim time limit in s (default 240, scaled up with map size)")
+    parser.add_argument("--metrics", action="store_true",
+                        help="PBI-02: measure stability and performance (frame time, FPS / real-time "
+                             "factor, memory, start-up, glitches, environment changes) and check them "
+                             "against the limits in stability.py at the end")
+    parser.add_argument("--command-script", default="",
+                        help="headless: operator commands at sim times, e.g. "
+                             "\"20:AVOID:C,45:REINCLUDE:C,60:RETURN_PLAN\" (stability tests)")
     parser.add_argument("--profile", action="store_true",
                         help="print per-section timings every 5 s (GUI mode)")
     parser.add_argument("--lat", type=float, help="last known position latitude (enables OSM world)")
@@ -499,6 +527,12 @@ def main():
         args.person_category, person_xy = parse_person(args.person)
     except ValueError as exc:
         parser.error(f"--person: {exc}")
+    try:
+        command_script = parse_command_script(args.command_script)
+    except ValueError as exc:
+        parser.error(f"--command-script: {exc}")
+    perf = StabilityMonitor(args.metrics, gui=not args.headless)
+    perf.t_program = t_program                     # start-up is timed from program start
 
     # ---- Saved mission state (PBI-10). With --resume the last saved state is loaded and the
     # operator's starting information is reused, so the same world (and person spot) is rebuilt.
@@ -800,6 +834,9 @@ def main():
                                follow=lambda: follow_destination(mission, nav))
     ui_times = ResponseTimer()           # click -> on screen, and panel refresh times (50 ms limit)
 
+    # PBI-02: start-up done; remember where every obstacle, the floor and the person are.
+    perf.started(p, list(obstacle_ids) + [floor_id, person.body_id])
+    map_half = sim_config.MAP_HALF
     next_tick = time.perf_counter()      # deadline for the next render tick (GUI pacing)
     tick_t0 = next_tick                  # start of the current tick, for the profiler
     try:
@@ -880,6 +917,13 @@ def main():
                     with prof.section("cmd effects"), rendering_paused(gui):   # route lines drawn in one go
                         pipeline.run_effects()
 
+            # PBI-02: scripted operator commands (headless stability runs): same two stages as a click.
+            while command_script and not gui and nav.t >= command_script[0][0]:
+                _t, cmd_name, cmd_zone = command_script.pop(0)
+                res = pipeline.submit(cmd_name, cmd_zone)
+                print(f"[operator] t={nav.t:.1f}s {cmd_name} {cmd_zone or ''}: {res.message}")
+                if pipeline.pending:
+                    pipeline.run_effects()
             with prof.section("logic"):
                 holding = False
                 if mission.state == "SEARCHING":
@@ -1081,7 +1125,13 @@ def main():
                 with prof.section("save"):              # GUI: only a copy here, written by a worker
                     saver.autosave(mission, nav.pos, belief=belief, sim_t=nav.t)
 
+            perf.step(p, nav.pos, nav.t, drone_id, obstacle_ids, map_half=map_half, v_max=V_MAX,
+                      v_z=V_Z, dt=DT, max_alt=MAX_ALT)                        # PBI-02 glitch checks
             step_count += 1
+            if step_count % RENDER_EVERY == 0:
+                perf.frame_done(shown=gui)                                    # PBI-02 frame time
+                if not gui:
+                    perf.frame_start()
             if not gui and mission.state in ("FOUND", "ABORT", "COMPLETE"):
                 break
             # Pace once per render tick, at the end of the group of logic steps, so the next
@@ -1097,12 +1147,14 @@ def main():
                     next_tick = time.perf_counter()   # fell behind; don't try to catch up
                 prof.end_tick()
                 tick_t0 = time.perf_counter()
+                perf.frame_start()
         # Time limit reached without a find: end the search and report where to look next.
         if p.isConnected() and nav.t >= max_time and mission.state == "SEARCHING":
             mission.time_up(searcher.most_likely())
     except KeyboardInterrupt:
         pass
     finally:
+        perf.finish(p, nav.t)                        # PBI-02: environment compared before anything closes
         # Final save on a normal exit / Ctrl+C / error (a hard crash is covered by the autosaves).
         saver.autosave(mission, nav.pos, force=True, belief=belief, sim_t=nav.t)
         if saver is not store:
@@ -1137,6 +1189,12 @@ def main():
         if confirm_times_ms:
             print(f"Operator commands: {len(confirm_times_ms)} | slowest confirmation "
                   f"{max(confirm_times_ms):.1f} ms (target < 1000 ms)")
+        if perf.enabled:                                 # PBI-02
+            print(perf.format_report())
+            import json as _json
+            print("Stability:", _json.dumps({**perf.summary(), "passed": perf.passed(),
+                                            "glitch_list": perf.glitches,
+                                            "environment_changes": perf.env_changes}))
         p.disconnect()
 
 
