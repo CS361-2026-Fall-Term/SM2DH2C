@@ -11,6 +11,15 @@ Tests (run from `Sprint3/`):
 python -m unittest discover -s tests -v            # runs every test codes in tests/
 ```
 
+PBI-05 (regression tests for the probability map, route planning and headless missions), see `tests/PBI05_REGRESSION_TEST_REPORT.md`:
+```
+python -m unittest tests.test_regression_pbi05 -v                    # AC-01..AC-04
+SKIP_SLOW=1 python -m unittest tests.test_regression_pbi05 -v        # skip the 3 headless missions
+BREAK_NORMALIZE=1 python -m unittest tests.test_regression_pbi05.ProbabilityMapTests -v   # AC-03: _normalize() broken on purpose, tests must fail
+```
+- The mission tests run `python main.py --headless --person X Y` for the default person (7, -5.5), a person under a tree (0.4, 1.3) and a person outside the zone plan (-9, -9), and check for `Mission: FOUND` within 240 s.
+- `BREAK_NORMALIZE=1` swaps `_normalize()` for a do-nothing version only while the tests run; the source file is not changed.
+
 PBI-12 (range sensor and climb-or-detour), results in `tests/RANGE_SENSOR_TEST_REPORT.md`:
 ```
 python -m unittest tests.test_range_sensor -v      # AC-01..AC-04
