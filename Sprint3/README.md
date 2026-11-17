@@ -30,6 +30,14 @@ python operator_guidance.py --selftest           # sample events through the mis
 python -m unittest tests.test_mission_events -v
 ```
 
+PBI-07 (operator dashboard stays responsive under heavy live input: clicks shown within 50 ms), code in `ui_responsiveness.py`, see `tests/UI_RESPONSIVENESS_REPORT.md`:
+```
+python -m unittest tests.test_ui_responsiveness_pbi07 -v   # AC-01..AC-03 with the real Tk panel (needs a display)
+python main.py --profile                                   # the final summary prints "UI response - click: ... refresh: ..."
+```
+- A click is shown on the panel first. The heavy work runs afterwards: the probability map, the route re-plan, and the heatmap repaint, which now runs in batches.
+- Mission saves are written by a background thread. No new dependencies.
+
 PBI-08 (live mission display: six fields together, updates within 300 ms), code in `display_status.py`:
 ```
 python -m unittest tests.test_display_pbi08 -v     # AC-01..AC-04 + weak-network cases, no simulator needed

@@ -27,6 +27,8 @@ Saving rules (MissionStateStore.autosave):
   * Any change to the mission (state, plan, visited, destination, response, new history line)
     is written immediately - far inside the 1 second limit (PBI-10 acceptance criterion).
   * While SEARCHING the drone position is also refreshed every PERIODIC_SAVE_S seconds.
+  * PBI-07: main.py wraps the store in BackgroundSaver, so the slow part of a save (JSON,
+    checksum, write, fsync) runs on a worker thread and the operator UI never waits for the disk.
 """
 
 import hashlib
@@ -149,8 +151,15 @@ def validate_payload(p):
     return p
 
 
-def _checksum(payload):
-    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+def _payload_json(payload):
+    """The payload as canonical JSON (sorted keys, no spaces). The checksum is taken over this
+    text, and (PBI-07) the same text is written into the file, so a save serialises the payload
+    once instead of twice. Loading re-parses it and gets the same checksum back."""
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _checksum(payload, blob=None):
+    blob = _payload_json(payload) if blob is None else blob
     return hashlib.sha256(blob.encode("ascii")).hexdigest()
 
 
@@ -190,14 +199,20 @@ class MissionStateStore:
                       if zones else None)
 
     def build(self, mission, drone_pos=None, belief=None, sim_t=None):
+        return self.build_from(mission.snapshot(), drone_pos,
+                               belief.grid if belief is not None else None, sim_t)
+
+    def build_from(self, mission_snapshot, drone_pos=None, belief_grid=None, sim_t=None):
+        """build() from data already copied out of the live objects (a Mission.snapshot() and a
+        copy of the probability map's grid). BackgroundSaver uses it on its worker thread."""
         return {
-            "mission": mission.snapshot(),
+            "mission": mission_snapshot,
             "setup": self.setup,
             "zones": self.zones,
             "drone": ({"pos": [float(v) for v in drone_pos],
                        "t": float(sim_t) if sim_t is not None else None}
                       if drone_pos is not None else None),
-            "belief": belief_to_data(belief) if belief is not None else None,
+            "belief": grid_to_data(belief_grid) if belief_grid is not None else None,
         }
 
     # -- writing --------------------------------------------------------------------------
@@ -205,9 +220,10 @@ class MissionStateStore:
         """Atomically write payload. Returns the seconds it took. Raises OSError on failure
         (autosave() catches it, so the simulation never crashes because of a full disk)."""
         t0 = time.perf_counter()
-        doc = {"version": SCHEMA_VERSION, "saved_at": round(self.wall(), 3),
-               "checksum": _checksum(payload), "payload": payload}
-        data = json.dumps(doc, indent=1, ensure_ascii=True).encode("ascii")
+        blob = _payload_json(payload)                  # serialised once (PBI-07)
+        head = json.dumps({"version": SCHEMA_VERSION, "saved_at": round(self.wall(), 3),
+                           "checksum": _checksum(payload, blob)}, ensure_ascii=True)
+        data = (head[:-1] + ', "payload": ' + blob + "}").encode("ascii")
         folder = os.path.dirname(os.path.abspath(self.path))
         fd, tmp = tempfile.mkstemp(dir=folder, prefix=".mission_state.", suffix=".tmp")
         try:
@@ -247,31 +263,51 @@ class MissionStateStore:
         """Call once per render tick. Saves right away when the mission changed; otherwise
         refreshes the drone position (and probability map) every PERIODIC_SAVE_S while
         SEARCHING. Never raises. Returns True when a file was written."""
-        fp = (mission.state, tuple(mission.plan), tuple(mission.visited),
-              tuple(mission.excluded), tuple(mission.original_plan),
-              tuple(mission.destination) if mission.destination else None,
-              mission.response, len(mission.history), mission.history[-1] if mission.history else None)
-        
+        due = self.due(mission, force)
+        if due is None:
+            return False
+        fp, durable, now = due
+        try:
+            self.save(self.build(mission, drone_pos, belief, sim_t), durable=durable)
+        except Exception as exc:                         # disk full, read-only folder, ...
+            self.save_failed(exc, now)
+            return False
+        self.saved(fp, now)
+        return True
+
+    # The three steps of autosave(), shared with BackgroundSaver (PBI-07).
+    @staticmethod
+    def fingerprint(mission):
+        """What counts as 'the mission changed' (a new history line included)."""
+        return (mission.state, tuple(mission.plan), tuple(mission.visited),
+                tuple(mission.excluded), tuple(mission.original_plan),
+                tuple(mission.destination) if mission.destination else None,
+                mission.response, getattr(mission, "history_count", len(mission.history)),
+                mission.history[-1] if mission.history else None)
+
+    def due(self, mission, force=False):
+        """None if nothing needs saving now, else (fingerprint, durable, now)."""
+        fp = self.fingerprint(mission)
         now = self.clock()
         changed = fp != self._fingerprint
-        due = mission.state == "SEARCHING" and now - self._last_save_t >= PERIODIC_SAVE_S
-        if not (force or changed or due):
-            return False
-        try:
-            self.save(self.build(mission, drone_pos, belief, sim_t), durable=force or changed)
-        except Exception as exc:                         # disk full, read-only folder, ...
-            self.last_error = f"{type(exc).__name__}: {exc}"
-            if not self._warned:
-                self._warned = True
-                print(f"[state] WARNING: could not save mission state ({self.last_error}); "
-                      "the mission continues without saving.", flush=True)
-            self._last_save_t = now                      # do not retry on every tick
-            return False
+        periodic = mission.state == "SEARCHING" and now - self._last_save_t >= PERIODIC_SAVE_S
+        if not (force or changed or periodic):
+            return None
+        return fp, force or changed, now
+
+    def saved(self, fp, now):
         self._fingerprint = fp
         self._last_save_t = now
         self.last_error = None
         self._warned = False
-        return True
+
+    def save_failed(self, exc, now):
+        self.last_error = f"{type(exc).__name__}: {exc}"
+        if not self._warned:
+            self._warned = True
+            print(f"[state] WARNING: could not save mission state ({self.last_error}); "
+                  "the mission continues without saving.", flush=True)
+        self._last_save_t = now                          # do not retry on every tick
 
     # -- reading --------------------------------------------------------------------------
     def _read(self, path):
@@ -324,6 +360,110 @@ class MissionStateStore:
         return moved
 
 
+class BackgroundSaver:
+    """PBI-07: MissionStateStore.autosave() with the slow part moved off the UI thread.
+
+    A save used to cost the main loop 6-34 ms per change (serialising the whole history and the
+    probability map, then fsync), and with live data the mission changes on almost every frame.
+    Now autosave() here only decides whether a save is due and copies the state (about 0.3 ms:
+    Mission.snapshot() plus a copy of the probability grid). A worker thread does the rest:
+    JSON, checksum, atomic write, fsync.
+
+    Newest wins: while the worker is writing, further changes replace the one waiting snapshot,
+    so a burst of 100 live messages becomes a couple of saves, never a queue that grows. Saves
+    are at most MIN_GAP_S apart (still far inside PBI-10's 1 second limit). close() writes the
+    final state and waits for it, so nothing is lost on a normal exit.
+
+    Same call as the store: autosave(mission, drone_pos, force, belief, sim_t) -> True when a
+    save was queued. store.saves / max_save_s / last_error keep working (set by the worker)."""
+
+    MIN_GAP_S = 0.1
+
+    def __init__(self, store):
+        import threading
+        self.store = store
+        self.queued = 0                           # snapshots handed to the worker
+        self.coalesced = 0                        # snapshots replaced by a newer one before writing
+        self._cv = threading.Condition()
+        self._job = None                          # (payload parts, fp, durable, now) waiting
+        self._busy = False
+        self._stop = False
+        self._last_write = -1e9
+        self._thread = threading.Thread(target=self._run, name="mission-state-saver", daemon=True)
+        self._thread.start()
+
+    def autosave(self, mission, drone_pos=None, force=False, belief=None, sim_t=None):
+        """Called once per render tick from the UI thread; never blocks on disk."""
+        st = self.store
+        due = st.due(mission, force)
+        if due is None:
+            return False
+        fp, durable, now = due
+        parts = (mission.snapshot(), list(drone_pos) if drone_pos is not None else None,
+                 belief.grid.copy() if belief is not None else None, sim_t)
+        # Mark it saved now so the next tick does not queue the same state again; a failure on
+        # the worker is reported through store.last_error, as before.
+        st.saved(fp, now)
+        with self._cv:
+            if self._job is not None:
+                self.coalesced += 1
+                durable = durable or self._job[2]
+            self._job = (parts, fp, durable, now)
+            self.queued += 1
+            self._cv.notify()
+        if force:
+            self.flush()
+        return True
+
+    def _run(self):
+        while True:
+            with self._cv:
+                while self._job is None and not self._stop:
+                    self._cv.wait()
+                if self._job is None:
+                    return
+                wait = self._last_write + self.MIN_GAP_S - time.monotonic()
+                if wait > 0 and not self._stop:
+                    self._cv.wait(wait)               # let more changes coalesce into one save
+                    continue
+                job, self._job, self._busy = self._job, None, True
+            (snap, pos, grid, sim_t), _fp, durable, now = job
+            try:
+                self.store.save(self.store.build_from(snap, pos, grid, sim_t), durable=durable)
+            except Exception as exc:                  # disk full, read-only folder, ...
+                self.store.save_failed(exc, now)
+            with self._cv:
+                self._busy = False
+                self._last_write = time.monotonic()
+                self._cv.notify_all()
+
+    def flush(self, timeout=5.0):
+        """Wait until everything queued so far is on disk. Returns False on timeout."""
+        end = time.monotonic() + timeout
+        with self._cv:
+            self._last_write = -1e9                   # write now, skip the MIN_GAP_S wait
+            self._cv.notify_all()
+            while self._job is not None or self._busy:
+                left = end - time.monotonic()
+                if left <= 0:
+                    return False
+                self._cv.wait(left)
+        return True
+
+    def close(self, timeout=5.0):
+        """Write what is left and stop the worker."""
+        ok = self.flush(timeout)
+        with self._cv:
+            self._stop = True
+            self._cv.notify_all()
+        self._thread.join(timeout)
+        return ok
+
+    # the store's counters, so main.py's end-of-run report reads the same either way
+    def __getattr__(self, name):
+        return getattr(self.store, name)
+
+
 # ----------------------------------------------------- bridging the saved setup and main.py --
 def setup_from_args(args, person_xy=None):
     """The operator's starting information, taken from main.py's parsed arguments.
@@ -355,8 +495,13 @@ def apply_setup_to_args(args, setup):
 
 def belief_to_data(belief):
     """The probability map's cell values as plain JSON data."""
-    ny, nx = belief.grid.shape
-    return {"shape": [int(ny), int(nx)], "grid": [float(v) for v in belief.grid.ravel()]}
+    return grid_to_data(belief.grid)
+
+
+def grid_to_data(grid):
+    """A probability-map grid (numpy array, ny x nx) as plain JSON data."""
+    ny, nx = grid.shape
+    return {"shape": [int(ny), int(nx)], "grid": grid.ravel().tolist()}
 
 
 def restore_belief(belief, data):

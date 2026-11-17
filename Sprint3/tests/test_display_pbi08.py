@@ -37,7 +37,11 @@ def _main_const(name):
 
 
 HUD_EVERY = _main_const("HUD_EVERY")
-POLL_EVERY = _main_const("BUTTON_POLL_EVERY")
+# Live fields are refreshed every PANEL_REFRESH_EVERY render ticks (PBI-07: clicks are read every
+# tick, but the status refresh cadence is what bounds the display latency modelled here). Since
+# PBI-07 the panel also draws right after a refresh, so "drawn at the next refresh" below is a
+# conservative upper bound.
+POLL_EVERY = _main_const("PANEL_REFRESH_EVERY")
 
 
 class FakeNav:

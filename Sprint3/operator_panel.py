@@ -14,9 +14,16 @@ the live operator controls live here instead:
       navigation aborted, returned to launch, plan complete)
     * plan / searched / excluded summary, heatmap and camera buttons
 
-The window never blocks the simulation: main.py calls poll() from its loop (about 20 times a
-second), which processes Tk events and returns what the operator pressed since the last call.
-The panel has no mission logic of its own: commands are validated by operator_guidance.Mission.
+The window never blocks the simulation: main.py calls poll() from its loop (every render tick,
+60 times a second), which processes Tk events and returns what the operator pressed since the
+last call. The panel has no mission logic of its own: commands are validated by
+operator_guidance.Mission.
+
+PBI-07 (responsive under heavy live input):
+    * after a click main.py calls refresh() and then flush(), so the reply is drawn at once
+      instead of at the next poll; poll() also records when the click came in (input_t)
+    * new log lines are written in one batch, and at most LOG_KEEP of them, however many
+      live messages arrived since the last refresh
 """
 
 ZONE_FILL = {"next": "#2e7d32", "planned": "#1e88e5", "searched": "#757575", "excluded": "#c62828"}
@@ -35,6 +42,12 @@ MIN_TEXT_SCALE = 0.75          # still too tall: shrink all text (and so buttons
 MIN_FONT_PT = 8                # ...but never below this (smaller is unreadable); then it scrolls
 LOG_LINES = 7                   # visible lines in the message log (it scrolls)
 LOG_KEEP = 300                  # older messages are dropped past this many
+# PBI-07: fixed heights (text lines) of the boxes that change live; longer text is cut at the
+# bottom of the box (the full message is always in the log)
+RESULT_LINES = 3                # latest message (2 on the compact layout)
+EVENT_LINES = 3                 # latest detection / obstacle event (format_event_latest: 3 lines)
+STATUS_LINES = 8                # six live fields + navigation line (+ map-search part when it wraps)
+PLAN_LINES = 3                  # next zone / plan / searched + excluded
 OK_FG, BAD_FG, SUB_FG, EVENT_FG = "#1b5e20", "#b71c1c", "#555555", "#0d47a1"
 LATEST_BG = {"ok": "#e8f5e9", "bad": "#ffebee", "event": "#e3f2fd", "info": "white"}
 
@@ -76,6 +89,9 @@ class OperatorPanel:
         self.zone_commands = set(zone_commands)
         self.events = []
         self.closed = False
+        self._input_t = None        # PBI-07: perf_counter() of the oldest click not yet returned
+        self.input_t = None         # ...and of the batch the last poll() returned (None: no clicks)
+        self._flash_ids = set()     # pending button un-press timers (cancelled on close)
         self._shown = {}            # widget -> last text/colour, so refresh() only touches changes
         self._hist_n = 0            # mission.history entries already copied into the log
         self._last_resp = None      # last mission.response seen (catches messages not in history)
@@ -172,9 +188,11 @@ class OperatorPanel:
 
         # --- PBI-14: detections and obstacles (latest event + recent events)
         header("Detections & obstacles")
+        # PBI-07: boxes whose text changes live have a FIXED number of lines (height=...), so new
+        # text never changes the panel's layout; a layout change costs Tk 40-70 ms to redo.
         self.event_lbl = tk.Label(frm, text="No detection or obstacle events yet.", font=self.f_bold,
-                                  bg="white", fg=SUB_FG, anchor="w", justify="left", wraplength=330,
-                                  padx=8, pady=6, relief="groove", bd=2, width=40)
+                                  bg="white", fg=SUB_FG, anchor="nw", justify="left", wraplength=330,
+                                  padx=8, pady=6, relief="groove", bd=2, width=40, height=EVENT_LINES)
         self.event_lbl.grid(row=row, column=0, sticky="we"); row += 1
         self.event_list = tk.Text(frm, height=3 if c else EVENT_ROWS, width=46, wrap="none",
                                   font=self.f_small, bg="white", relief="sunken",
@@ -187,8 +205,9 @@ class OperatorPanel:
         # --- latest message + status + plan
         header("Mission messages")
         self.result_lbl = tk.Label(frm, text="No messages yet.", font=self.f_bold, bg="white",
-                                   fg=SUB_FG, anchor="w", justify="left", wraplength=330,
-                                   padx=8, pady=6, relief="groove", bd=2, width=40)
+                                   fg=SUB_FG, anchor="nw", justify="left", wraplength=330,
+                                   padx=8, pady=6, relief="groove", bd=2, width=40,
+                                   height=RESULT_LINES - (1 if c else 0))
         self.result_lbl.grid(row=row, column=0, sticky="we"); row += 1
         # full log, newest at the bottom; read-only, scrolls
         logf = tk.Frame(frm, bg=PANEL_BG); logf.grid(row=row, column=0, sticky="we", pady=(6, 0)); row += 1
@@ -201,12 +220,12 @@ class OperatorPanel:
         self.log.tag_configure("time", foreground="#888888")
         for kind, colour in (("ok", OK_FG), ("bad", BAD_FG), ("event", EVENT_FG), ("info", "#222222")):
             self.log.tag_configure(kind, foreground=colour)
-        self.status_lbl = tk.Label(frm, text="", font=self.f_norm, bg=PANEL_BG, anchor="w",
-                                   justify="left", wraplength=340)
-        self.status_lbl.grid(row=row, column=0, sticky="w", pady=(6, 0)); row += 1
-        self.plan_lbl = tk.Label(frm, text="", font=self.f_norm, bg=PANEL_BG, anchor="w",
-                                 justify="left", wraplength=340)
-        self.plan_lbl.grid(row=row, column=0, sticky="w"); row += 1
+        self.status_lbl = tk.Label(frm, text="", font=self.f_norm, bg=PANEL_BG, anchor="nw",
+                                   justify="left", wraplength=340, height=STATUS_LINES)
+        self.status_lbl.grid(row=row, column=0, sticky="we", pady=(6, 0)); row += 1
+        self.plan_lbl = tk.Label(frm, text="", font=self.f_norm, bg=PANEL_BG, anchor="nw",
+                                 justify="left", wraplength=340, height=PLAN_LINES)
+        self.plan_lbl.grid(row=row, column=0, sticky="we"); row += 1
 
         # --- view
         header("View")
@@ -231,11 +250,21 @@ class OperatorPanel:
                      padx=6, pady=self.btn_pady, relief="raised", bd=2, cursor="hand2")
         b._colours = colours
 
+        def unflash():
+            self._flash_ids.discard(getattr(b, "_flash_id", None))
+            if b.winfo_exists():
+                b.configure(bg=b._colours[0], relief="raised")
+
         def press(_e):
             b.configure(bg=dark, relief="sunken")
             action()
-            b.after(FLASH_MS, lambda: b.winfo_exists() and b.configure(bg=b._colours[0],
-                                                                       relief="raised"))
+            # one pending "un-press" per button; remembered so close() can cancel it (otherwise Tk
+            # prints "invalid command name" if the window closes within FLASH_MS of a click)
+            if getattr(b, "_flash_id", None) in self._flash_ids:
+                b.after_cancel(b._flash_id)
+                self._flash_ids.discard(b._flash_id)
+            b._flash_id = b.after(FLASH_MS, unflash)
+            self._flash_ids.add(b._flash_id)
         b.bind("<Button-1>", press)
         return b
 
@@ -247,11 +276,17 @@ class OperatorPanel:
             widget.configure(**kw)
 
     def _emit(self, event):
+        import time as _time
+        if not self.events:                 # PBI-07: when the oldest unhandled click came in
+            self._input_t = _time.perf_counter()
         self.events.append(event)
 
     def _on_close(self):
         self.closed = True
         try:
+            for fid in list(self._flash_ids):        # pending button un-press timers
+                self.root.after_cancel(fid)
+            self._flash_ids.clear()
             self.root.destroy()
         except self.tk.TclError:
             pass
@@ -373,25 +408,38 @@ class OperatorPanel:
         return "info"
 
     def _add_message(self, ts, source, msg):
+        """One line into the log (same as _add_messages with a single line)."""
+        self._add_messages([(ts, source, msg)])
+
+    def _add_messages(self, lines):
+        """Append (timestamp, source, message) lines to the log in ONE Tk insert (PBI-07).
+        Writing line by line cost about 0.4 ms per line (1000 live messages froze the panel for
+        ~440 ms); one insert of the whole batch plus one trim and one scroll stays a few ms."""
         import time as _time
-        kind = self._kind(source, msg)
-        stamp = _time.strftime("%H:%M:%S", _time.localtime(ts))
+        if not lines:
+            return
         log = self.log
+        first = float(log.index("end-1c")) <= 1.0      # log still empty
+        chunks = []                                    # text, tag, text, tag, ...
+        kind = "info"
+        for i, (ts, source, msg) in enumerate(lines):
+            kind = self._kind(source, msg)
+            stamp = _time.strftime("%H:%M:%S", _time.localtime(ts))
+            chunks += [("" if first and i == 0 else "\n") + stamp + "  ", "time", msg, kind]
         log.configure(state="normal")
-        if float(log.index("end-1c")) > 1.0:            # not the first line
-            log.insert("end", "\n")
-        log.insert("end", stamp + "  ", "time")
-        log.insert("end", msg, kind)
+        log.insert("end", *chunks)
         extra = int(float(log.index("end-1c"))) - LOG_KEEP
         if extra > 0:
             log.delete("1.0", f"{extra + 1}.0")
         log.configure(state="disabled")
         log.see("end")
-        self._latest = (msg, kind)
+        self._latest = (lines[-1][2], kind)
 
     def _collect_messages(self, mission):
         """Copy new mission messages into the log: every mission.history entry, plus any
-        mission.response that main.py set directly (those don't go through history)."""
+        mission.response that main.py set directly (those don't go through history).
+        PBI-07: however many lines arrived since the last refresh, only the newest LOG_KEEP are
+        drawn (older ones would be trimmed straight away) and they go in as one batch."""
         import time as _time
         hist = mission.history
         # history_count = lines ever recorded (the list itself is capped, PBI-10), so new lines
@@ -399,16 +447,16 @@ class OperatorPanel:
         total = getattr(mission, "history_count", len(hist))
         if self._hist_n > total:                        # history was reset (e.g. restored)
             self._hist_n = 0
-        new = min(total - self._hist_n, len(hist))
-        for ts, source, msg in (hist[-new:] if new > 0 else []):
-            self._add_message(ts, str(source), msg)
+        new = min(total - self._hist_n, len(hist), LOG_KEEP)
+        batch = [(ts, str(source), msg) for ts, source, msg in (hist[-new:] if new > 0 else [])]
         logged_last = hist[-1][2] if hist else None
         self._hist_n = total
         # Zone arrivals are logged by Mission.arrived() (PBI-10), so they come in with history.
         resp = mission.response
         if resp and resp != self._last_resp and resp != logged_last:
-            self._add_message(_time.time(), "MISSION", resp)
+            batch.append((_time.time(), "MISSION", resp))
         self._last_resp = resp
+        self._add_messages(batch)
 
     # ----------------------------------------------------------------- docking --
     def dock(self):
@@ -467,7 +515,19 @@ class OperatorPanel:
         except self.tk.TclError:          # window was destroyed
             self.closed = True
         ev, self.events = self.events, []
+        self.input_t, self._input_t = (self._input_t if ev else None), None
         return ev
+
+    def flush(self):
+        """PBI-07: draw what refresh() just changed NOW, instead of at the next poll(). Used right
+        after an operator click so the reply is on screen before any heavy work starts.
+        Only redraws (no new input is read), so it is cheap: about 1-3 ms."""
+        if self.closed:
+            return
+        try:
+            self.root.update_idletasks()
+        except self.tk.TclError:
+            self.closed = True
 
     def refresh(self, mission, selected, status_of, last_result=None, camera_mode=None,
                 status_text=None):

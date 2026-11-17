@@ -47,16 +47,19 @@ from target_detection import MissingPerson, SearchMonitor, explain_method, LOG_M
 from operator_guidance import Mission, Cmd, ZONES, ZONE_COMMANDS, scale_zones
 from map_search import MapGuidedSearch, SightingConfirm
 from probability_map import ProbabilityMap
-from mission_state import (MissionStateStore, DEFAULT_PATH, setup_from_args,
+from mission_state import (MissionStateStore, BackgroundSaver, DEFAULT_PATH, setup_from_args,
                            apply_setup_to_args, describe, restore_belief)
+from ui_responsiveness import CommandPipeline, ResponseTimer
 
 # Mission logic (navigation, detection, probability map) still advances every DT (240 Hz).
 # Everything that talks to the PyBullet GUI (button reads, pose push, stepSimulation, camera,
 # heatmap, HUD text, sleeping) happens once per RENDER_EVERY logic steps: 4 -> 60 Hz.
 RENDER_EVERY = 4
-HUD_EVERY = 4                 # HUD text refresh, in render ticks (60 / 4 = 15 Hz = 67 ms; PBI-08 needs < 300 ms); only re-sent if changed
+HUD_EVERY = 2                 # HUD text refresh, in render ticks (60 / 2 = 30 Hz = 33 ms; PBI-07 needs < 50 ms, was 4 = 67 ms); only re-sent if changed
 HUD_LINE_SPACING = 0.045       # HUD line gap per metre of camera distance (debug text has no line breaks)
-BUTTON_POLL_EVERY = 3         # operator buttons are polled every 3rd render tick (20 Hz)
+BUTTON_POLL_EVERY = 1         # PBI-07: operator clicks are read every render tick (60 Hz, <= 17 ms wait; was 3 = 50 ms)
+PANEL_REFRESH_EVERY = 2       # live status fields on the panel are refreshed (and drawn) every 2nd render
+                              # tick (30 Hz = 33 ms, PBI-07 needs < 50 ms), and right away after a click
 FOLLOW_VIEW = (8.0, 45.0, -35.0)  # locked chase camera: distance (m), yaw (deg), pitch (deg)
 # Camera modes, in the order the in-sim "Camera" button cycles through them:
 #   locked - follows the drone at FOLLOW_VIEW; the user cannot move the camera
@@ -68,7 +71,25 @@ CAMERA_HELP = {"locked": "following the drone, locked view (no user control)",
                "free": "free; arrow keys / PageUp / PageDown to move, Ctrl/Alt + drag to rotate, "
                        "wheel to zoom (Ctrl/Alt + middle-drag also pans)"}
 PAN_SPEED = 0.8               # free camera: arrow-key speed, in camera distances per second
-HEATMAP_BUDGET = 8            # max heatmap tiles recolored per render tick
+HEATMAP_EVERY = 15            # PBI-07: heatmap repainted every 15th render tick (4 Hz), all changed tiles at
+                              # once with rendering paused (~10-30 ms), instead of 8 tiles every tick, which
+                              # cost 30-130 ms per frame in the GUI (each recolour waits for the render thread)
+
+
+@contextlib.contextmanager
+def rendering_paused(gui):
+    """PBI-07: run a batch of GUI drawing calls (HUD text, zone markers, route lines) with the 3D
+    view's rendering paused. With rendering on, every such call waits for PyBullet's render
+    thread (5-16 ms each), so redrawing the HUD and zone markers after a command took 80-120 ms;
+    paused, the whole batch is a few ms. The window keeps showing the last frame meanwhile."""
+    if not gui:
+        yield
+        return
+    p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0)
+    try:
+        yield
+    finally:
+        p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
 
 
 class Profiler:
@@ -159,26 +180,38 @@ def apply_operator_command(mission, cmd, zone, nav, belief, reroute=None):
     destination changed, and an Investigate (reported sighting) raises the probability map there.
     reroute: function(nav, xy) used to re-plan; defaults to set_destination (tests pass a stub).
     """
-    reroute = reroute or set_destination
     res = mission.handle(cmd, zone)
     if res.ok:
-        if belief is not None:
-            sigma = max(2.5, 0.15 * sim_config.MAP_HALF)
-            if hasattr(belief, "apply_guidance"):
-                # PBI-03: sightings raise the map, Do not search / Re-include / Return to plan
-                # exclude and restore the zone's cells.
-                rect = zone_rect(ZONES[res.zone], sim_config.MAP_HALF) if res.zone in ZONES else None
-                belief.apply_guidance(res.command, res.zone, rect, res.sighting,
-                                      sighting_sigma=sigma, sighting_weight=0.5)
-            elif res.sighting is not None:
-                belief.add_sighting(res.sighting, sigma=sigma, weight=0.5)
+        apply_command_map(res, belief)
         if res.reroute:
-            if mission.destination:
-                reroute(nav, mission.destination)
-            else:                                   # nothing left to search
-                nav.route = []
-                nav.state = "DONE"
+            follow_destination(mission, nav, reroute)
     return res
+
+
+def apply_command_map(res, belief):
+    """Probability-map part of an accepted operator command (PBI-03)."""
+    if belief is None:
+        return
+    sigma = max(2.5, 0.15 * sim_config.MAP_HALF)
+    if hasattr(belief, "apply_guidance"):
+        # PBI-03: sightings raise the map, Do not search / Re-include / Return to plan
+        # exclude and restore the zone's cells.
+        rect = zone_rect(ZONES[res.zone], sim_config.MAP_HALF) if res.zone in ZONES else None
+        belief.apply_guidance(res.command, res.zone, rect, res.sighting,
+                              sighting_sigma=sigma, sighting_weight=0.5)
+    elif res.sighting is not None:
+        belief.add_sighting(res.sighting, sigma=sigma, weight=0.5)
+
+
+def follow_destination(mission, nav, reroute=None):
+    """Route part of an accepted command: re-plan to the mission's destination, or stop if
+    nothing is left to search. The slow step of a click (A* re-plan)."""
+    reroute = reroute or set_destination
+    if mission.destination:
+        reroute(nav, mission.destination)
+    else:                                       # nothing left to search
+        nav.route = []
+        nav.state = "DONE"
 
 
 # Compass direction of each zone from the map centre (x = east, y = north), for button labels.
@@ -724,6 +757,7 @@ def main():
     zone_label_ids = {}
     last_zone_sig = None
     force_hud = False                    # re-send the HUD right away (operator command feedback)
+    heat_now = False                     # repaint the heatmap this tick (operator toggled it)
     pending_confirm = None               # (time the command was read, result) until it is shown
     confirm_times_ms = []                # input -> on-screen confirmation, for every command
     status_id = None
@@ -756,7 +790,15 @@ def main():
                                      cameraPitch=FOLLOW_VIEW[2], cameraTargetPosition=cam_pos)
     elif mission.state == "IDLE":
         start_mission(mission, nav, belief, exclude_zones)
-    store.autosave(mission, nav.pos, force=True, belief=belief, sim_t=nav.t)   # first save
+    # PBI-07: with the GUI, saves are written by a worker thread so the operator UI never waits for
+    # the disk (headless runs keep saving inline: nothing to keep responsive there).
+    saver = BackgroundSaver(store) if gui else store
+    saver.autosave(mission, nav.pos, force=True, belief=belief, sim_t=nav.t)   # first save
+    # PBI-07: operator commands in two stages - mission + panel reply first, then the heavy part
+    # (probability map, route re-plan) once the reply is on screen. See ui_responsiveness.py.
+    pipeline = CommandPipeline(mission, apply_map=lambda res: apply_command_map(res, belief),
+                               follow=lambda: follow_destination(mission, nav))
+    ui_times = ResponseTimer()           # click -> on screen, and panel refresh times (50 ms limit)
 
     next_tick = time.perf_counter()      # deadline for the next render tick (GUI pacing)
     tick_t0 = next_tick                  # start of the current tick, for the profiler
@@ -764,10 +806,16 @@ def main():
         while p.isConnected() and nav.t < max_time:
             render = step_count % render_every == 0
 
-            # Operator panel, polled at 20 Hz: button presses come back as events, handled below.
-            if gui and render and (step_count // render_every) % BUTTON_POLL_EVERY == 0:
+            # Operator panel (PBI-07). Clicks are read every render tick (60 Hz). A click is handled
+            # in two stages: the mission is updated and the panel redrawn at once (stage 1), then
+            # the heavy part - probability map, route re-plan - runs after the reply is on screen
+            # (stage 2, pipeline.run_effects()). Without clicks the live status fields are
+            # refreshed every PANEL_REFRESH_EVERY ticks.
+            render_tick = step_count // render_every
+            if gui and render and render_tick % BUTTON_POLL_EVERY == 0:
                 with prof.section("buttons"):
                     events = panel.poll()
+                    t_input = panel.input_t          # when the oldest of these clicks came in
                     if panel_sig is not None:        # Tk has now drawn what refresh() set last time
                         latency.shown("panel", panel_sig)
                         panel_sig = None
@@ -777,10 +825,15 @@ def main():
                     for ev in events:
                         kind = ev[0]
                         if kind == "start":
-                            start_mission(mission, nav, belief, exclude_zones)
+                            # the first route is planned in stage 2, after the panel shows the start
+                            start_mission(mission, nav, belief, exclude_zones,
+                                          reroute=lambda _nav, _xy: pipeline.request_follow())
                             force_hud = True
                         elif kind == "heat":
-                            belief.set_heatmap_visible(not belief.heatmap_visible)
+                            # only flips the setting; the batched heatmap repaint below does the
+                            # tiles this same tick (was ~900 GUI calls = 3-5 s frozen)
+                            belief.set_heatmap_visible(not belief.heatmap_visible, repaint=False)
+                            heat_now = True
                         elif kind == "cam":
                             cam_mode = CAMERA_MODES[(CAMERA_MODES.index(cam_mode) + 1) % len(CAMERA_MODES)]
                             # glide from wherever the camera is now (no jump when the mode changes)
@@ -795,16 +848,15 @@ def main():
                                 print(f"[operator] Zone {selected_zone} selected")
                             force_hud = True
                         elif kind == "cmd":
+                            # stage 1: validate + update the mission only (< 0.1 ms)
                             cmd = ev[1]
-                            t_cmd = time.perf_counter()
-                            res = apply_operator_command(
-                                mission, cmd, selected_zone if cmd in ZONE_COMMANDS else None,
-                                nav, belief)
+                            res = pipeline.submit(cmd, selected_zone if cmd in ZONE_COMMANDS else None)
                             print(f"[operator] {res.message} (validated in {res.validate_ms:.3f} ms)")
                             force_hud = True
-                            pending_confirm = (t_cmd, res)
+                            pending_confirm = (t_input, res)
                             last_result = res
-                    if not panel.closed:
+                    if not panel.closed and (events or render_tick % PANEL_REFRESH_EVERY == 0):
+                        t_ref = time.perf_counter()
                         # cheap: only widgets whose text/colour changed are touched
                         # PBI-08: the six live fields, always together at the top of the status text
                         fields = display_status.fields_from_sim(mission, nav, monitor, searcher, holding)
@@ -815,6 +867,18 @@ def main():
                                       f"Navigation: {nav.state}   |   Detection: {monitor.state} "
                                       f"({monitor.confidence:.2f})" + map_status(searcher, mission))
                         panel_sig = display_status.signature(fields)
+                        # PBI-07: draw now, not at the next poll - a click's reply is on screen
+                        # before stage 2 starts, and the live fields are never a tick behind
+                        panel.flush()
+                        latency.shown("panel", panel_sig)
+                        panel_sig = None
+                        if events:
+                            ui_times.add("click", (time.perf_counter() - t_input) * 1000.0)
+                        ui_times.add("refresh", (time.perf_counter() - t_ref) * 1000.0)
+                # stage 2: the heavy part of the clicks, now that the operator sees the reply
+                if pipeline.pending:
+                    with prof.section("cmd effects"), rendering_paused(gui):   # route lines drawn in one go
+                        pipeline.run_effects()
 
             with prof.section("logic"):
                 holding = False
@@ -900,10 +964,13 @@ def main():
                         nav.state = "FOUND"
 
             if gui and render:
-                # Heatmap recolors at most HEATMAP_BUDGET tiles per tick: each recolor is a
-                # call into the GUI, so a small steady budget avoids frame-time spikes.
-                with prof.section("heatmap"):
-                    belief.draw_heatmap(budget=HEATMAP_BUDGET)
+                # PBI-07: heatmap repainted in one batch with rendering paused, every HEATMAP_EVERY
+                # ticks (or right after the operator toggles it). Each recolour with rendering on
+                # waits for the GUI's render thread, which made the whole 3D view lag.
+                if heat_now or (step_count // render_every) % HEATMAP_EVERY == 0:
+                    heat_now = False
+                    with prof.section("heatmap"):
+                        belief.draw_heatmap(budget=None, pause_rendering=True)
 
                 # PBI-08: the six live fields (position, mission state, destination, plan,
                 # moving/stopped, possible sighting); the tracker times change -> drawn.
@@ -915,7 +982,7 @@ def main():
                 # forces an immediate refresh, so its confirmation appears on the next frame.
                 if (step_count // render_every) % HUD_EVERY == 0 or force_hud:
                     force_hud = False
-                    with prof.section("hud"):
+                    with prof.section("hud"), rendering_paused(gui):     # PBI-07: one batch
                         nxt = (f"Zone {mission.plan[0]}" if mission.plan else
                                f"map cell {map_search.fmt(searcher.target)}" if searcher.active
                                else "none")
@@ -1011,8 +1078,8 @@ def main():
             # PBI-10: save right away when the mission changed (state, plan, zones, a new message),
             # and refresh the drone position + probability map every 0.5 s while searching.
             if render:
-                with prof.section("save"):
-                    store.autosave(mission, nav.pos, belief=belief, sim_t=nav.t)
+                with prof.section("save"):              # GUI: only a copy here, written by a worker
+                    saver.autosave(mission, nav.pos, belief=belief, sim_t=nav.t)
 
             step_count += 1
             if not gui and mission.state in ("FOUND", "ABORT", "COMPLETE"):
@@ -1037,7 +1104,9 @@ def main():
         pass
     finally:
         # Final save on a normal exit / Ctrl+C / error (a hard crash is covered by the autosaves).
-        store.autosave(mission, nav.pos, force=True, belief=belief, sim_t=nav.t)
+        saver.autosave(mission, nav.pos, force=True, belief=belief, sim_t=nav.t)
+        if saver is not store:
+            saver.close()                            # waits until the final state is on disk
         if store.saves:
             print(f"[state] Mission state saved to {store.path} ({store.saves} saves, slowest "
                   f"{store.max_save_s * 1000:.1f} ms)")
@@ -1061,6 +1130,10 @@ def main():
         print("Events:", mission.history)
         if gui:
             print(latency.report())                      # PBI-08: target < 300 ms
+            print(ui_times.report())                     # PBI-07: target < 50 ms
+            if pipeline.replans_saved:
+                print(f"Operator commands: {pipeline.replans_saved} route re-plans skipped "
+                      "(a newer click replaced them)")
         if confirm_times_ms:
             print(f"Operator commands: {len(confirm_times_ms)} | slowest confirmation "
                   f"{max(confirm_times_ms):.1f} ms (target < 1000 ms)")
